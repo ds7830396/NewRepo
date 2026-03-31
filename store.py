@@ -176,7 +176,18 @@ def get_product_messages(prod_id):
     if not prod or not prod['synonyms']:
         return jsonify({'proposed': [], 'confirmed': []})
     
-    synonyms = [s.strip().lower() for s in prod['synonyms'].split(',') if s.strip()]
+    # --- УМНАЯ ОЧИСТКА ТЕКСТА ---
+   # --- УМНАЯ ОЧИСТКА ТЕКСТА ---
+    # --- УМНАЯ ОЧИСТКА ТЕКСТА ---
+    import re
+    def clean_for_search(text):
+        if not text: return ""
+        t = re.sub(r'\s+', ' ', text.replace('\xa0', ' ')).strip().lower()
+        t = t.translate(str.maketrans('асеокрх', 'aceokpx'))
+        return t
+
+    synonyms = [clean_for_search(s) for s in prod['synonyms'].split(',') if s.strip()]
+    # ----------------------------
     
     # 1. Получаем все сообщения пользователя + КАСТОМНЫЕ ИМЕНА ИЗ ПАРСЕРА
     all_msgs = db.execute("""
@@ -280,7 +291,8 @@ def get_product_messages(prod_id):
                 continue
             
             seen_fps.add(fp)
-            text_lower = line.lower()
+            text_lower = clean_for_search(line)
+            
             if any(syn in text_lower for syn in synonyms):
                 proposed_list.append({
                     'message_id': msg_id,
@@ -1298,20 +1310,59 @@ def publish_scheduler():
                     message_id = pub['message_id']
                     
                     # 3. ОТПРАВКА В ТЕЛЕГРАМ
+                    # 3. ОТПРАВКА В ТЕЛЕГРАМ
+                    # 3. ОТПРАВКА В ТЕЛЕГРАМ
                     async def update_or_create(cid, mid, txt, p_id):
+                        try:
+                            cid = int(cid)
+                        except ValueError:
+                            pass
+
+                        # --- ЛОГИКА РАЗДЕЛЕНИЯ ТЕКСТА ---
+                        parts = []
+                        max_len = 4000 # Оставляем небольшой запас до 4096
+                        temp_txt = txt
+                        
+                        while len(temp_txt) > max_len:
+                            # Ищем последний перенос строки в пределах лимита, чтобы не рвать строку пополам
+                            split_idx = temp_txt.rfind('\n', 0, max_len)
+                            if split_idx == -1:
+                                split_idx = max_len # Если нет переносов, режем жестко
+                                
+                            parts.append(temp_txt[:split_idx])
+                            temp_txt = temp_txt[split_idx:].strip()
+                            
+                        if temp_txt:
+                            parts.append(temp_txt)
+                        # --------------------------------
+
                         if mid:
                             try:
-                                await tg_client.edit_message(cid, int(mid), txt)
+                                # ВАЖНЫЙ НЮАНС ПРИ РЕДАКТИРОВАНИИ: 
+                                # Telegram не позволяет превратить 1 старое сообщение в 2 новых.
+                                # Поэтому при редактировании обновится только первая часть, а остаток обрежется.
+                                await tg_client.edit_message(cid, int(mid), parts[0])
+                                if len(parts) > 1:
+                                    logger.warning(f"Прайс слишком большой для обновления одного сообщения (ID {mid}). Хвост обрезан.")
                             except Exception as e:
                                 logger.error(f"Ошибка редактирования: {e}")
                         else:
                             try:
-                                msg = await tg_client.send_message(cid, txt)
-                                with app.app_context():
-                                    db.execute("UPDATE publications SET message_id = ? WHERE id = ?", (str(msg.id), p_id))
-                                    db.commit()
+                                # В режиме "отправки нового" просто шлем все куски друг за другом
+                                first_msg = None
+                                for part in parts:
+                                    msg = await tg_client.send_message(cid, part)
+                                    if not first_msg:
+                                        first_msg = msg # Запоминаем только самое первое сообщение
+
+                                # Сохраняем в базу ID первого сообщения (если захотите его потом удалять/редактировать)
+                                if first_msg:
+                                    with app.app_context():
+                                        local_db = get_db()
+                                        local_db.execute("UPDATE publications SET message_id = ? WHERE id = ?", (str(first_msg.id), p_id))
+                                        local_db.commit()
                             except Exception as e:
-                                logger.error(f"Ошибка отправки: {e}")
+                                logger.error(f"Ошибка отправки разделенного сообщения: {e}")
                                 
                     asyncio.run_coroutine_threadsafe(update_or_create(chat_id, message_id, message_text, pub_id), loop)
                     last_publish_times[pub_id] = now
@@ -2769,11 +2820,22 @@ def save_publication():
         """, (data.get('name'), data.get('is_active', 0), data.get('interval_min', 60), 
               data.get('chat_id'), data.get('message_id'), data.get('userbot_id'), 
               data.get('template'), allowed_items_json, markup_type, markup_value, rounding))
+        # Получаем ID только что созданной публикации
+        pub_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        
+    # --- СОХРАНЕНИЕ НАЦЕНОК, КОТОРЫЕ БЫЛИ ДОБАВЛЕНЫ ДО СОЗДАНИЯ ПУБЛИКАЦИИ ---
+    temp_markups = data.get('temp_markups', [])
+    for m in temp_markups:
+        db.execute("""
+            INSERT INTO pub_markups (pub_id, folder_id, markup_type, markup_value, rounding) 
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(pub_id, folder_id) DO UPDATE SET 
+            markup_type=excluded.markup_type, markup_value=excluded.markup_value, rounding=excluded.rounding
+        """, (pub_id, m['folder_id'], m['markup_type'], m['markup_value'], m['rounding']))
         
     db.commit()
     notify_clients()
     return jsonify({'success': True})
-
 
 @app.route('/api/publications/<int:pub_id>', methods=['DELETE'])
 @login_required
@@ -8116,9 +8178,6 @@ async function openPublishEditor(pubId = null) {
             document.getElementById('pub_message_id').value = pubData.message_id || '';
             document.getElementById('pub_userbot_id').value = pubData.userbot_id || '';
             document.getElementById('pub_template').value = pubData.template || '';
-            document.getElementById('pub_markup_type').value = pubData.markup_type || 'percent'; // <--- НОВОЕ
-        document.getElementById('pub_markup_value').value = pubData.markup_value || 0;       // <--- НОВОЕ
-        document.getElementById('pub_rounding').value = pubData.rounding || 100;
             try { allowedItems = JSON.parse(pubData.allowed_items) || {}; } catch(e) {}
         }
     } else {
@@ -8128,12 +8187,10 @@ async function openPublishEditor(pubId = null) {
         document.getElementById('pub_interval').value = 60;
         document.getElementById('pub_chat_id').value = '';
         document.getElementById('pub_message_id').value = '';
-        document.getElementById('pub_markup_type').value = 'percent'; // <--- НОВОЕ
-        document.getElementById('pub_markup_value').value = 0;        // <--- НОВОЕ
-        document.getElementById('pub_rounding').value = 100;
         document.getElementById('pub_userbot_id').value = '';
         document.getElementById('pub_template').value = 'Цены на товары:';
     }
+    
     // Загрузка папок в выпадающий список
     const folders = await cachedApiFetch('/api/folders/tree');
     const folderSelect = document.getElementById('pub-markup-folder');
@@ -8149,18 +8206,22 @@ async function openPublishEditor(pubId = null) {
         addOpt(folders);
     }
 
-    // Переключение видимости (как в API - наценки доступны только после первого сохранения)
+    // --- ИЗМЕНЕНИЕ: НАЦЕНКИ ВСЕГДА ДОСТУПНЫ ---
+    document.getElementById('pub-markups-content').style.display = 'block';
+    const warningText = document.getElementById('pub-markups-warning');
+    if (warningText) warningText.style.display = 'none';
+
     if (pubId) {
-        document.getElementById('pub-markups-content').style.display = 'block';
-        document.getElementById('pub-markups-warning').style.display = 'none';
         loadPubMarkups(pubId);
     } else {
-        document.getElementById('pub-markups-content').style.display = 'none';
-        document.getElementById('pub-markups-warning').style.display = 'block';
+        // Очищаем таблицу и создаем временную память для новых наценок
+        window.tempPubMarkups = [];
+        document.getElementById('pub-markups-tbody').innerHTML = '';
     }
+    
     // Рендерим дерево
-    const treeData = await cachedApiFetch('/api/publish_tree_data'); // <-- Новый URL
-renderPublishTree(treeData.folders, treeData.products, treeData.suppliers, allowedItems); // <-- Передаем suppliers
+    const treeData = await cachedApiFetch('/api/publish_tree_data'); 
+    renderPublishTree(treeData.folders, treeData.products, treeData.suppliers, allowedItems); 
 }
 
 function renderPublishTree(folders, products, suppliers, allowedItems) {
@@ -8228,7 +8289,6 @@ async function savePublication() {
     const pubId = document.getElementById('pub_id').value;
     const allowedItems = {};
     
-    // Теперь собираем не товары, а выбранных поставщиков под товарами
     document.querySelectorAll('.pub-supplier-cb:checked').forEach(cb => {
         const prodId = cb.getAttribute('data-product');
         const supId = cb.value;
@@ -8246,10 +8306,7 @@ async function savePublication() {
         userbot_id: document.getElementById('pub_userbot_id').value,
         template: document.getElementById('pub_template').value,
         allowed_items: allowedItems,
-        // НОВЫЕ СТРОКИ НИЖЕ:
-        markup_type: document.getElementById('pub_markup_type').value,
-        markup_value: parseFloat(document.getElementById('pub_markup_value').value) || 0,
-        rounding: parseInt(document.getElementById('pub_rounding').value) || 100
+        temp_markups: window.tempPubMarkups || [] // <--- Передаем временные наценки
     };
 
     if (!payload.name || !payload.chat_id || !payload.userbot_id) {
@@ -8300,16 +8357,55 @@ async function loadPubMarkups(pubId) {
 
 async function savePubMarkup() {
     const pubId = document.getElementById('pub_id').value;
-    if (!pubId) return;
-    const body = {
-        folder_id: parseInt(document.getElementById('pub-markup-folder').value),
-        markup_type: document.getElementById('pub-markup-type').value,
-        markup_value: parseFloat(document.getElementById('pub-markup-value').value),
-        rounding: parseInt(document.getElementById('pub-markup-rounding').value)
-    };
-    await apiFetch(`/api/publications/${pubId}/markups`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    loadPubMarkups(pubId);
+
+    const folderSelect = document.getElementById('pub-markup-folder');
+    const folderId = parseInt(folderSelect.value);
+    const folderName = folderSelect.options[folderSelect.selectedIndex].text.replace(/—/g, '').trim();
+
+    const mType = document.getElementById('pub-markup-type').value;
+    const mValue = parseFloat(document.getElementById('pub-markup-value').value) || 0;
+    const rounding = parseInt(document.getElementById('pub-markup-rounding').value) || 100;
+
+    if (pubId) {
+        // Если публикация уже сохранена, отправляем сразу в БД
+        const body = { folder_id: folderId, markup_type: mType, markup_value: mValue, rounding: rounding };
+        await apiFetch(`/api/publications/${pubId}/markups`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        loadPubMarkups(pubId);
+    } else {
+        // Если публикация новая, сохраняем в оперативную память браузера
+        if (!window.tempPubMarkups) window.tempPubMarkups = [];
+        
+        const existingIdx = window.tempPubMarkups.findIndex(m => m.folder_id === folderId);
+        if (existingIdx !== -1) {
+            window.tempPubMarkups[existingIdx] = { folder_id: folderId, folder_name: folderName, markup_type: mType, markup_value: mValue, rounding: rounding };
+        } else {
+            window.tempPubMarkups.push({ folder_id: folderId, folder_name: folderName, markup_type: mType, markup_value: mValue, rounding: rounding });
+        }
+        renderTempPubMarkups();
+    }
 }
+
+// Новая функция для отрисовки временных наценок
+function renderTempPubMarkups() {
+    const tbody = document.getElementById('pub-markups-tbody');
+    tbody.innerHTML = (window.tempPubMarkups || []).map(m => `
+        <tr>
+            <td><strong style="color:${m.folder_id === 0 ? '#f39c12' : '#fff'};">${m.folder_id === 0 ? 'Базовая (Для остальных)' : escapeHtml(m.folder_name)}</strong></td>
+            <td>${m.markup_value > 0 ? '+' : ''}${m.markup_value}${m.markup_type === 'percent' ? '%' : ' руб'}</td>
+            <td>До ${m.rounding}</td>
+            <td>
+                ${m.folder_id === 0 ? '<span style="color:#888; font-size:11px;">(Базовая)</span>' : `<button class="save-btn" style="background:#e74c3c; font-size:12px; padding:4px 8px;" onclick="deleteTempPubMarkup(${m.folder_id})">❌</button>`}
+            </td>
+        </tr>
+    `).join('');
+}
+
+// Новая функция для удаления временных наценок
+window.deleteTempPubMarkup = function(folderId) {
+    if(!confirm('Удалить эту наценку?')) return;
+    window.tempPubMarkups = window.tempPubMarkups.filter(m => m.folder_id !== folderId);
+    renderTempPubMarkups();
+};
 
 async function deletePubMarkup(id) {
     if(!confirm('Удалить эту наценку?')) return;
