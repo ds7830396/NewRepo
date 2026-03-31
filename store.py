@@ -54,11 +54,18 @@ import logging
 
 # --- ПОДАВЛЕНИЕ СИСТЕМНЫХ ОШИБОК TELETHON ПРИ ЗАКРЫТИИ ПОТОКОВ ---
 def custom_exception_handler(loop, context):
-    msg = context.get("exception", context["message"])
-    # Игнорируем ошибки, связанные с закрытым циклом событий или GeneratorExit
-    if isinstance(msg, (RuntimeError, GeneratorExit)) or "Task was destroyed" in str(msg) or "Event loop is closed" in str(msg):
+    exception = context.get("exception")
+    msg_str = str(exception) if exception else str(context.get("message", ""))
+    
+    # 1. Игнорируем ошибки закрытого цикла
+    if isinstance(exception, (RuntimeError, GeneratorExit)) or "Task was destroyed" in msg_str or "Event loop is closed" in msg_str:
         return
-    # Для остальных ошибок используем стандартный обработчик
+    
+    # 2. Игнорируем внутренний баг Telethon при отмене задач (AttributeError)
+    if isinstance(exception, AttributeError) and "'NoneType' object has no attribute" in msg_str and ("recv" in msg_str or "disconnect" in msg_str):
+        return
+        
+    # Для остальных, реальных ошибок используем стандартный обработчик
     loop.default_exception_handler(context)
 
 # Применяем этот обработчик ко всем новым потокам
@@ -137,11 +144,13 @@ def bot_interaction_scheduler():
                             continue  # Время еще не пришло
                     
                     # Если время пришло, отправляем команды
+                    # Если время пришло, отправляем команды
                     if userbot_id in user_clients:
                         _, client, _ = user_clients[userbot_id]
                         loop = user_loops.get(userbot_id)
                         
-                        if loop and loop.is_running():
+                        # ДОБАВЛЕНА ПРОВЕРКА client.is_connected()
+                        if loop and loop.is_running() and client.is_connected():
                             commands = json.loads(interaction['commands'])
                             bot_username = interaction['bot_username']
                             
@@ -2497,27 +2506,36 @@ def get_qr():
     data = request.get_json()
     api_id = data.get('api_id')
     api_hash = data.get('api_hash')
+    session_id = data.get('session_id') # <--- ВОТ ЗДЕСЬ ПРИНИМАЕМ ID СТАРОЙ СЕССИИ
     user_id = session['user_id']
 
     if not api_id or not api_hash:
         return jsonify({'success': False, 'error': 'Missing fields'}), 400
 
     db = get_db()
-    cursor = db.execute(
-        "INSERT INTO user_telegram_sessions (user_id, api_id, api_hash, status) VALUES (?, ?, ?, 'pending')",
-        (user_id, api_id, api_hash)
-    )
-    db.commit()
-    notify_clients()
-    session_id = cursor.lastrowid
-    session_file = f'sessions/user_{user_id}_{session_id}'
     
+    # --- ИСПРАВЛЕННАЯ ЛОГИКА ---
+    if session_id:
+        # Если передали ID старой сессии, просто обновляем её статус
+        db.execute("UPDATE user_telegram_sessions SET status = 'pending' WHERE id = ? AND user_id = ?", (session_id, user_id))
+    else:
+        # Иначе создаем новую
+        cursor = db.execute(
+            "INSERT INTO user_telegram_sessions (user_id, api_id, api_hash, status) VALUES (?, ?, ?, 'pending')",
+            (user_id, api_id, api_hash)
+        )
+        session_id = cursor.lastrowid
+    # ---------------------------
+        
+    db.commit()
+    if 'notify_clients' in globals(): notify_clients()
+    
+    session_file = f'sessions/user_{user_id}_{session_id}'
     q = queue.Queue()
 
     def qr_worker():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop = asyncio.new_event_loop()
         client = TelegramClient(session_file, int(api_id), api_hash)
 
         async def _run():
@@ -2535,10 +2553,10 @@ def get_qr():
                 await client.disconnect()
                 
                 with app.app_context():
-                    db = get_db()
-                    db.execute("UPDATE user_telegram_sessions SET status = 'active' WHERE id = ?", (session_id,))
-                    db.commit()
-                    notify_clients()
+                    local_db = get_db()
+                    local_db.execute("UPDATE user_telegram_sessions SET status = 'active' WHERE id = ?", (session_id,))
+                    local_db.commit()
+                    if 'notify_clients' in globals(): notify_clients()
                 logging.info(f"Сессия {session_id}: статус обновлён на active")
                 start_message_listener(session_id, user_id, api_id, api_hash)
 
@@ -2546,13 +2564,19 @@ def get_qr():
                 logging.error(f"Сессия {session_id}: таймаут ожидания QR")
                 await client.disconnect()
                 with app.app_context():
-                    db = get_db()
-                    db.execute("DELETE FROM user_telegram_sessions WHERE id = ?", (session_id,))
-                    db.commit()
-                    notify_clients()
+                    local_db = get_db()
+                    # Если ошибка, возвращаем статус unauthorized вместо удаления
+                    local_db.execute("UPDATE user_telegram_sessions SET status = 'unauthorized' WHERE id = ?", (session_id,))
+                    local_db.commit()
+                    if 'notify_clients' in globals(): notify_clients()
             except Exception as e:
                 logging.exception(f"Сессия {session_id}: ошибка при ожидании QR")
                 await client.disconnect()
+                with app.app_context():
+                    local_db = get_db()
+                    local_db.execute("UPDATE user_telegram_sessions SET status = 'unauthorized' WHERE id = ?", (session_id,))
+                    local_db.commit()
+                    if 'notify_clients' in globals(): notify_clients()
             finally:
                 qr_sessions.pop(session_id, None)
 
@@ -2565,23 +2589,23 @@ def get_qr():
     try:
         res = q.get(timeout=15)
     except queue.Empty:
-        db.execute("DELETE FROM user_telegram_sessions WHERE id = ?", (session_id,))
+        db.execute("UPDATE user_telegram_sessions SET status = 'unauthorized' WHERE id = ?", (session_id,))
         db.commit()
-        notify_clients()
+        if 'notify_clients' in globals(): notify_clients()
         return jsonify({'success': False, 'error': 'Таймаут генерации QR'}), 500
 
     if res.get('already_authorized'):
         start_message_listener(session_id, user_id, api_id, api_hash)
         db.execute("UPDATE user_telegram_sessions SET status = 'active' WHERE id = ?", (session_id,))
         db.commit()
-        notify_clients()
+        if 'notify_clients' in globals(): notify_clients()
         return jsonify({'success': True, 'already_authorized': True})
 
     qr_url = res.get('qr_url')
     if not qr_url:
-        db.execute("DELETE FROM user_telegram_sessions WHERE id = ?", (session_id,))
+        db.execute("UPDATE user_telegram_sessions SET status = 'unauthorized' WHERE id = ?", (session_id,))
         db.commit()
-        notify_clients()
+        if 'notify_clients' in globals(): notify_clients()
         return jsonify({'success': False, 'error': 'Не удалось сгенерировать QR'}), 500
 
     qr_sessions[session_id] = True 
@@ -3728,7 +3752,7 @@ TEMPLATE = """
     </div>
     
     <div class="bot-form">
-        <div class="form-group">
+        <input type="hidden" id="auth_session_id"> <div class="form-group">
             <label>API ID</label>
             <input type="text" id="api_id" placeholder="12345" value="12345">
         </div>
@@ -4732,54 +4756,76 @@ function filterProductsByFolder(folderId, folderName) {
         const qrStatus = document.getElementById('qr-status');
         let checkInterval = null;
 
-        qrBtn.addEventListener('click', async () => {
-            const apiId = document.getElementById('api_id').value.trim();
-            const apiHash = document.getElementById('api_hash').value.trim();
-            if (!apiId || !apiHash) {
-                alert('Заполните API ID и API Hash');
-                return;
-            }
- 
-            qrStatus.innerText = 'Генерация QR...';
-            qrContainer.style.display = 'block';
-            qrImage.innerHTML = '';
-            
-            try {
-                const response = await fetch('/api/get_qr', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ api_id: apiId, api_hash: apiHash })
-                });
-                const data = await response.json();
-     
-                if (data.success) {
-                    if (data.already_authorized) {
-                        qrStatus.innerText = '✅ Вы уже авторизованы. Запускаем слушатель...';
+        // --- 1. ВЫНОСИМ ЛОГИКУ В ОТДЕЛЬНУЮ ФУНКЦИЮ ---
+// Теперь она умеет принимать sessionId и отправлять его на сервер (для обновления старой сессии)
+window.generateQR = async function(apiId, apiHash, sessionId = null) {
+    qrStatus.innerText = 'Генерация QR...';
+    qrContainer.style.display = 'block';
+    qrImage.innerHTML = '';
+    
+    try {
+        const bodyData = { api_id: apiId, api_hash: apiHash };
+        
+        // Если передан ID старой сессии, обязательно добавляем его в запрос!
+        if (sessionId) {
+            bodyData.session_id = sessionId;
+        }
+
+        const response = await fetch('/api/get_qr', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(bodyData)
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            if (data.already_authorized) {
+                qrStatus.innerText = '✅ Вы уже авторизованы. Запускаем слушатель...';
+                startPolling();
+                loadUserbots();
+                setTimeout(() => { document.getElementById('bot-form-container').style.display = 'none'; }, 2000);
+            } else if (data.qr) {
+                qrImage.innerHTML = `<img src="data:image/png;base64,${data.qr}" alt="QR код">`;
+                qrStatus.innerText = 'Отсканируйте QR в Telegram. Ожидание входа...';
+                if (checkInterval) clearInterval(checkInterval);
+                checkInterval = setInterval(async () => {
+                    const statusResp = await fetch('/api/check_login?session_id=' + data.session_id);
+                    const statusData = await statusResp.json();
+                    if (statusData.success) {
+                        qrStatus.innerText = '✅ Авторизация успешна!';
+                        clearInterval(checkInterval);
+                        checkInterval = null;
                         startPolling();
                         loadUserbots();
-                    } else if (data.qr) {
-                        qrImage.innerHTML = `<img src="data:image/png;base64,${data.qr}" alt="QR код">`;
-                        qrStatus.innerText = 'Отсканируйте QR в Telegram. Ожидание входа...';
-                        if (checkInterval) clearInterval(checkInterval);
-                        checkInterval = setInterval(async () => {
-                            const statusResp = await fetch('/api/check_login?session_id=' + data.session_id);
-                            const statusData = await statusResp.json();
-                            if (statusData.success) {
-                                qrStatus.innerText = '✅ Авторизация успешна!';
-                                clearInterval(checkInterval);
-                                checkInterval = null;
-                                startPolling();
-                                loadUserbots();
-                            }
-                        }, 2000);
+                        setTimeout(() => { document.getElementById('bot-form-container').style.display = 'none'; }, 2000);
                     }
-                } else {
-                    qrStatus.innerText = 'Ошибка: ' + data.error;
-                }
-            } catch (e) {
-                qrStatus.innerText = 'Ошибка запроса.';
+                }, 2000);
             }
-        });
+        } else {
+            qrStatus.innerText = 'Ошибка: ' + data.error;
+        }
+    } catch (e) {
+        qrStatus.innerText = 'Ошибка запроса.';
+    }
+};
+
+// --- 2. ОБНОВЛЯЕМ КНОПКУ В ФОРМЕ ---
+qrBtn.addEventListener('click', async () => {
+    const apiId = document.getElementById('api_id').value.trim();
+    const apiHash = document.getElementById('api_hash').value.trim();
+    
+    // Пытаемся достать ID старой сессии из скрытого поля
+    const sessionInput = document.getElementById('auth_session_id');
+    const sessionId = sessionInput && sessionInput.value ? sessionInput.value : null;
+    
+    if (!apiId || !apiHash) {
+        alert('Заполните API ID и API Hash');
+        return;
+    }
+    
+    // Передаем данные в нашу новую функцию (включая sessionId, если он есть)
+    await window.generateQR(apiId, apiHash, sessionId);
+});
         
         // --- Логика Сводного отчета ---
         // --- Логика Сводного отчета ---
@@ -6159,83 +6205,102 @@ function initInboxFilters() {
        
   // 2. ФУНКЦИИ УПРАВЛЕНИЯ ЮЗЕРБОТАМИ
  async function loadUserbots() {
-        const bots = await cachedApiFetch('/api/userbots');
-        const container = document.getElementById('userbot-list');
-        if (!container) return;
+    const bots = await cachedApiFetch('/api/userbots');
+    const container = document.getElementById('userbot-list');
+    if (!container) return;
+    
+    if (!bots.length) {
+        container.innerHTML = '<p>Нет добавленных аккаунтов.</p>';
+        return;
+    }
+    
+    let html = '<table class="simple-table"><tr><th>Аккаунт</th><th>Статус</th><th>Время</th><th>Действия</th></tr>';
+    
+    bots.forEach(bot => {
+        const ubotName = bot.account_name || 'Неизвестно';
+        const isChecked = bot.schedule_enabled ? 'checked' : '';
         
-        if (!bots.length) {
-            container.innerHTML = '<p>Нет добавленных аккаунтов.</p>';
-            return;
+        let statusHtml = '';
+        let toggleBtnHtml = '';
+        
+        if (bot.status === 'active') {
+            statusHtml = '🟢 Активен';
+            toggleBtnHtml = `<button class="toggle-bot save-btn" style="padding:4px 8px; font-size:12px;" data-id="${bot.id}">Остановить</button>`;
+        } else if (bot.status === 'unauthorized') {
+            statusHtml = '<span style="color:#e74c3c; font-weight:bold;">🔴 Слетела авторизация</span>';
+            // Наша синяя кнопка для повторной авторизации
+            toggleBtnHtml = `<button class="reauth-bot save-btn" style="background:#3498db; padding:4px 8px; font-size:12px;" data-id="${bot.id}" data-api="${bot.api_id}" data-hash="${bot.api_hash}">Авторизоваться</button>`; 
+        } else {
+            statusHtml = '⚪ Выключен';
+            toggleBtnHtml = `<button class="toggle-bot save-btn" style="padding:4px 8px; font-size:12px;" data-id="${bot.id}">Запустить</button>`;
         }
         
-        let html = '<table class="simple-table"><tr><th>Аккаунт</th><th>Статус</th><th>Время</th><th>Действия</th></tr>';
-        
-        bots.forEach(bot => {
-            const ubotName = bot.account_name || 'Неизвестно';
-            const isChecked = bot.schedule_enabled ? 'checked' : '';
-            
-            // --- НОВАЯ ЛОГИКА ОТОБРАЖЕНИЯ СТАТУСОВ ---
-            let statusHtml = '';
-            let toggleBtnHtml = '';
-            
-            if (bot.status === 'active') {
-                statusHtml = '🟢 Активен';
-                toggleBtnHtml = `<button class="toggle-bot save-btn" style="padding:4px 8px; font-size:12px;" data-id="${bot.id}">Остановить</button>`;
-            } else if (bot.status === 'unauthorized') {
-                // Если слетела авторизация, выводим красное предупреждение и убираем кнопку "Запустить"
-                statusHtml = '<span style="color:#e74c3c; font-weight:bold;">🔴 Слетела авторизация</span><br><span style="font-size:11px; color:#aaa;">Удалите и добавьте заново</span>';
-                toggleBtnHtml = ''; 
-            } else {
-                statusHtml = '⚪ Выключен';
-                toggleBtnHtml = `<button class="toggle-bot save-btn" style="padding:4px 8px; font-size:12px;" data-id="${bot.id}">Запустить</button>`;
-            }
-            // -----------------------------------------
-            
-            html += `
-                <tr>
-                    <td>
-                        <strong style="color:#4a90e2;">${ubotName}</strong><br>
-                        <span style="font-size:11px; color:#888;">API ID: ${bot.api_id}</span>
-                    </td>
-                    <td>${statusHtml}</td>
-                    <td>
-                        <div style="display:flex; gap:5px; align-items:center; font-size: 13px;">
-                            <input type="checkbox" id="sch_en_${bot.id}" ${isChecked} title="Включить расписание по времени">
-                            <input type="time" id="sch_start_${bot.id}" value="${bot.time_start || '00:00'}" style="background:#1e1e1e; color:#fff; border:1px solid #3a3a3a; padding:4px; border-radius:4px;">
-                            - 
-                            <input type="time" id="sch_end_${bot.id}" value="${bot.time_end || '23:59'}" style="background:#1e1e1e; color:#fff; border:1px solid #3a3a3a; padding:4px; border-radius:4px;">
-                            <button class="save-btn" onclick="saveSchedule(${bot.id})" style="padding:4px 8px; font-size:14px; margin-left:5px;" title="Сохранить тайминг">💾</button>
-                        </div>
-                    </td>
-                    <td>
-                        ${toggleBtnHtml}
-                        <button class="delete-bot save-btn" style="background:#e74c3c; padding:4px 8px; font-size:12px;" data-id="${bot.id}">Удалить</button>
-                    </td>
-                </tr>`;
-        });
-        
-        html += '</table>';
-        container.innerHTML = html;
+        html += `
+            <tr>
+                <td>
+                    <strong style="color:#4a90e2;">${ubotName}</strong><br>
+                    <span style="font-size:11px; color:#888;">API ID: ${bot.api_id}</span>
+                </td>
+                <td>${statusHtml}</td>
+                <td>
+                    <div style="display:flex; gap:5px; align-items:center; font-size: 13px;">
+                        <input type="checkbox" id="sch_en_${bot.id}" ${isChecked} title="Включить расписание по времени">
+                        <input type="time" id="sch_start_${bot.id}" value="${bot.time_start || '00:00'}" style="background:#1e1e1e; color:#fff; border:1px solid #3a3a3a; padding:4px; border-radius:4px;">
+                        - 
+                        <input type="time" id="sch_end_${bot.id}" value="${bot.time_end || '23:59'}" style="background:#1e1e1e; color:#fff; border:1px solid #3a3a3a; padding:4px; border-radius:4px;">
+                        <button class="save-btn" onclick="saveSchedule(${bot.id})" style="padding:4px 8px; font-size:14px; margin-left:5px;" title="Сохранить тайминг">💾</button>
+                    </div>
+                </td>
+                <td>
+                    ${toggleBtnHtml}
+                    <button class="delete-bot save-btn" style="background:#e74c3c; padding:4px 8px; font-size:12px;" data-id="${bot.id}">Удалить</button>
+                </td>
+            </tr>`;
+    });
+    
+    html += '</table>';
+    container.innerHTML = html;
 
-        // Восстанавливаем обработчики кнопок
-        container.querySelectorAll('.toggle-bot').forEach(btn => {
-            btn.addEventListener('click', async () => {
-                await apiFetch(`/api/userbots/${btn.dataset.id}/toggle`, { method: 'POST' });
+    // --- ОБРАБОТЧИКИ КНОПОК ---
+
+    // 1. Кнопка Запустить / Остановить
+    container.querySelectorAll('.toggle-bot').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            await apiFetch(`/api/userbots/${btn.dataset.id}/toggle`, { method: 'POST' });
+            loadUserbots();
+        });
+    });
+
+    // 2. Кнопка Авторизоваться (при слетевшей сессии)
+    const addUserbotBtn = document.getElementById('add-userbot-btn');
+        if (addUserbotBtn) {
+            addUserbotBtn.addEventListener('click', () => {
+                const form = document.getElementById('bot-form-container');
+                form.style.display = form.style.display === 'none' || form.style.display === '' ? 'block' : 'none';
+                
+                // НОВОЕ: Очищаем поля, чтобы форма "забыла" старый аккаунт
+                const sessionInput = document.getElementById('auth_session_id');
+                if (sessionInput) sessionInput.value = '';
+                document.getElementById('api_id').value = '';
+                document.getElementById('api_hash').value = '';
+                
+                form.scrollIntoView({ behavior: 'smooth' });
+            });
+        }
+
+    // 3. Кнопка Удалить
+    container.querySelectorAll('.delete-bot').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            if (confirm('Удалить юзербота?')) {
+                await apiFetch(`/api/userbots/${btn.dataset.id}`, { method: 'DELETE' });
                 loadUserbots();
-            });
+                loadTrackedChats();
+            }
         });
-
-        container.querySelectorAll('.delete-bot').forEach(btn => {
-            btn.addEventListener('click', async () => {
-                if (confirm('Удалить юзербота?')) {
-                    await apiFetch(`/api/userbots/${btn.dataset.id}`, { method: 'DELETE' });
-                    loadUserbots();
-                    loadTrackedChats();
-                }
-            });
-        });
-    }
-
+    });
+}
+    // НОВОЕ: Обработчик для кнопки переавторизации
+        
     // НОВАЯ ФУНКЦИЯ ДЛЯ ОТПРАВКИ ТАЙМИНГА НА СЕРВЕР
     window.saveSchedule = async function(botId) {
         const enabled = document.getElementById(`sch_en_${botId}`).checked ? 1 : 0;
