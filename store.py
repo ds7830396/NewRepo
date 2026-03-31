@@ -11,6 +11,7 @@ import hashlib
 import functools
 from io import BytesIO
 from datetime import datetime
+from telethon.errors import AuthKeyUnregisteredError
 from flask import (
     Flask, session, request, render_template_string,
     jsonify, g, redirect, url_for, send_from_directory
@@ -116,6 +117,13 @@ def bot_interaction_scheduler():
                 now = datetime.now()
                 
                 for interaction in active_interactions:
+                    # 1. СНАЧАЛА достаем ID юзербота
+                    userbot_id = interaction['userbot_id']
+                    
+                    # 2. ЗАТЕМ проверяем, рабочее ли у него сейчас время
+                    if not is_parsing_allowed(userbot_id):
+                        continue 
+                        
                     last_run = interaction['last_run']
                     if last_run:
                         # Учитываем формат времени SQLite
@@ -129,7 +137,6 @@ def bot_interaction_scheduler():
                             continue  # Время еще не пришло
                     
                     # Если время пришло, отправляем команды
-                    userbot_id = interaction['userbot_id']
                     if userbot_id in user_clients:
                         _, client, _ = user_clients[userbot_id]
                         loop = user_loops.get(userbot_id)
@@ -146,7 +153,9 @@ def bot_interaction_scheduler():
                             # Обновляем время последнего запуска
                             db.execute("UPDATE interaction_bots SET last_run = ? WHERE id = ?", (now, interaction['id']))
                             db.commit()
-                            notify_clients()
+                            
+                            if 'notify_clients' in globals():
+                                notify_clients()
                              
         except Exception as e:
             logger.error(f"Ошибка в планировщике ботов: {e}")
@@ -1933,52 +1942,30 @@ def admin_required(f):
 
 # ---------- Фоновый слушатель сообщений ----------
 def stop_message_listener(session_id):
-    """
-    Безопасно останавливает сессию юзербота, закрывает соединение 
-    и очищает ресурсы в памяти и базе данных.
-    """
-    # 1. Извлекаем данные клиента, не удаляя их сразу
     client_info = user_clients.get(session_id)
-    
     if client_info:
         _, client, _ = client_info
         loop = user_loops.get(session_id)
-
-        # Пытаемся корректно закрыть соединение Telethon
         if loop and loop.is_running():
             async def safe_disconnect():
                 try:
-                    # Отключаемся от серверов Telegram
                     await client.disconnect()
-                except Exception as e:
-                    logging.debug(f"Сессия {session_id}: принудительное закрытие соединения ({e})")
-
+                except:
+                    pass
             try:
-                # Отправляем задачу в асинхронный поток
                 asyncio.run_coroutine_threadsafe(safe_disconnect(), loop)
-            except RuntimeError:
-                # Возникает, если цикл событий уже закрыт
+            except:
                 pass
 
-    # 2. Очищаем все глобальные словари (удаляем ссылки из памяти)
-    user_clients.pop(session_id, None)
-    user_loops.pop(session_id, None)
-    background_tasks.pop(session_id, None)
+    # ВАЖНО: Мы БОЛЬШЕ НЕ удаляем user_clients.pop() здесь!
+    # Это сделает сам фоновый поток перед своей смертью.
 
-    # 3. Обновляем статус в базе данных
     try:
         with app.app_context():
             db = get_db()
-            db.execute(
-                "UPDATE user_telegram_sessions SET status = 'inactive' WHERE id = ?", 
-                (session_id,)
-            )
+            db.execute("UPDATE user_telegram_sessions SET status = 'inactive' WHERE id = ?", (session_id,))
             db.commit()
-            # Уведомляем фронтенд через WebSocket (если используется)
-            if 'notify_clients' in globals():
-                notify_clients()
-                
-        logging.info(f"Сессия {session_id}: слушатель успешно остановлен")
+            if 'notify_clients' in globals(): notify_clients()
     except Exception as e:
         logging.error(f"Ошибка БД при остановке сессии {session_id}: {e}")
 
@@ -2054,7 +2041,7 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
 
         def listener():
             loop = asyncio.new_event_loop()
-            loop = asyncio.new_event_loop()
+         
             asyncio.set_event_loop(loop)
             session_file = f'sessions/user_{user_id}_{session_id}'
             client = TelegramClient(session_file, int(api_id), api_hash)
@@ -2298,20 +2285,36 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
 
             async def main():
                 await client.connect()
+            
+                # --- ОБРАБОТКА СЛЕТЕВШЕЙ АВТОРИЗАЦИИ ---
                 if not await client.is_user_authorized():
                     logging.error(f"Сессия {session_id}: Клиент не авторизован!")
-                    return
-                me = await client.get_me()
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
                 
-                # --- НОВОЕ: Получаем @username или Имя юзербота ---
+                    with app.app_context():
+                        db = get_db()
+                        # Устанавливаем статус unauthorized
+                        db.execute("UPDATE user_telegram_sessions SET status = 'unauthorized' WHERE id = ?", (session_id,))
+                        db.commit()
+                        if 'notify_clients' in globals(): notify_clients()
+                    return
+                # ---------------------------------------
+
+                me = await client.get_me()
+            
+                # --- Получаем @username или Имя юзербота ---
                 account_name = getattr(me, 'username', None)
                 if account_name:
                     account_name = f"@{account_name}"
                 else:
                     account_name = getattr(me, 'first_name', f"ID: {me.id}")
                 # --------------------------------------------------
-                
+            
                 logging.info(f"Сессия {session_id}: слушатель запущен для {me.first_name}")
+            
                 with app.app_context():
                     db = get_db()
                     try:
@@ -2325,28 +2328,62 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                             (session_file, session_id)
                         )
                     db.commit()
-                    notify_clients()
-                await client.run_until_disconnected()
+                    if 'notify_clients' in globals(): notify_clients()
+                
+                # Блокирующий вызов: клиент слушает события до отключения
+                # Блокирующий вызов: клиент слушает события до отключения
+                try:
+                    await client.run_until_disconnected()
+                except AuthKeyUnregisteredError:
+                    logging.error(f"Сессия {session_id}: Ключ авторизации отозван сервером Telegram (слетела сессия).")
+                    with app.app_context():
+                        db = get_db()
+                        db.execute("UPDATE user_telegram_sessions SET status = 'unauthorized' WHERE id = ?", (session_id,))
+                        db.commit()
+                        if 'notify_clients' in globals(): notify_clients()
 
+
+            # --- ЗАПУСК И БЕЗОПАСНАЯ ОЧИСТКА В ЦИКЛЕ ---
             try:
                 loop.run_until_complete(main())
             except Exception as e:
-                logging.exception(f"Сессия {session_id}: ошибка в слушателе")
+                logging.exception(f"Сессия {session_id}: ошибка в слушателе - {e}")
             finally:
+                # 1. Корректное отключение от серверов Telegram
+                try:
+                    if client and client.is_connected():
+                        loop.run_until_complete(client.disconnect())
+                except Exception:
+                    pass
+            
+                # 2. Очищаем глобальные словари ВНУТРИ родного потока.
+                # Это полностью исключает панику сборщика мусора (GC) в Flask!
                 user_clients.pop(session_id, None)
-                background_tasks.pop(session_id, None)
                 user_loops.pop(session_id, None)
-                with app.app_context():
-                    db = get_db()
-                    db.execute("UPDATE user_telegram_sessions SET status = 'inactive' WHERE id = ?", (session_id,))
-                    db.commit()
-                    notify_clients()
-                logging.info(f"Сессия {session_id}: слушатель остановлен")
+                background_tasks.pop(session_id, None)
 
-        thread = threading.Thread(target=listener, daemon=True)
-        thread.start()
-        background_tasks[session_id] = thread
-        logging.info(f"Поток слушателя для сессии {session_id} создан")
+                # 3. Отменяем оставшиеся фоновые задачи Telethon и закрываем цикл
+                try:
+                    tasks = asyncio.all_tasks(loop)
+                    for t in tasks:
+                        t.cancel()
+                
+                    if tasks:
+                        # Даем задачам шанс чисто закрыться (игнорируя ошибки отмены)
+                        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+                
+                    loop.close()
+                except Exception:
+                    pass
+
+                logging.info(f"Сессия {session_id}: слушатель полностью остановлен")
+
+    # --- СОЗДАНИЕ И ЗАПУСК ПОТОКА ---
+    # Даем потоку имя для удобства дебага
+    thread = threading.Thread(target=listener, daemon=True, name=f"UserbotThread-{session_id}")
+    thread.start()
+    background_tasks[session_id] = thread
+    logging.info(f"Поток слушателя для сессии {session_id} создан")
 
 # ---------- Маршруты Flask ----------
 @app.route('/')
@@ -6137,13 +6174,30 @@ function initInboxFilters() {
             const ubotName = bot.account_name || 'Неизвестно';
             const isChecked = bot.schedule_enabled ? 'checked' : '';
             
+            // --- НОВАЯ ЛОГИКА ОТОБРАЖЕНИЯ СТАТУСОВ ---
+            let statusHtml = '';
+            let toggleBtnHtml = '';
+            
+            if (bot.status === 'active') {
+                statusHtml = '🟢 Активен';
+                toggleBtnHtml = `<button class="toggle-bot save-btn" style="padding:4px 8px; font-size:12px;" data-id="${bot.id}">Остановить</button>`;
+            } else if (bot.status === 'unauthorized') {
+                // Если слетела авторизация, выводим красное предупреждение и убираем кнопку "Запустить"
+                statusHtml = '<span style="color:#e74c3c; font-weight:bold;">🔴 Слетела авторизация</span><br><span style="font-size:11px; color:#aaa;">Удалите и добавьте заново</span>';
+                toggleBtnHtml = ''; 
+            } else {
+                statusHtml = '⚪ Выключен';
+                toggleBtnHtml = `<button class="toggle-bot save-btn" style="padding:4px 8px; font-size:12px;" data-id="${bot.id}">Запустить</button>`;
+            }
+            // -----------------------------------------
+            
             html += `
                 <tr>
                     <td>
                         <strong style="color:#4a90e2;">${ubotName}</strong><br>
                         <span style="font-size:11px; color:#888;">API ID: ${bot.api_id}</span>
                     </td>
-                    <td>${bot.status === 'active' ? '🟢 Активен' : '🔴 Выключен'}</td>
+                    <td>${statusHtml}</td>
                     <td>
                         <div style="display:flex; gap:5px; align-items:center; font-size: 13px;">
                             <input type="checkbox" id="sch_en_${bot.id}" ${isChecked} title="Включить расписание по времени">
@@ -6154,7 +6208,7 @@ function initInboxFilters() {
                         </div>
                     </td>
                     <td>
-                        <button class="toggle-bot save-btn" style="padding:4px 8px; font-size:12px;" data-id="${bot.id}">${bot.status === 'active' ? 'Остановить' : 'Запустить'}</button>
+                        ${toggleBtnHtml}
                         <button class="delete-bot save-btn" style="background:#e74c3c; padding:4px 8px; font-size:12px;" data-id="${bot.id}">Удалить</button>
                     </td>
                 </tr>`;
@@ -9291,32 +9345,26 @@ def is_parsing_allowed(session_id):
     try:
         with app.app_context():
             db = get_db()
-            # ПРОВЕРЬТЕ НАЗВАНИЯ КОЛОНОК: возможно у вас они называются time_start и time_end
-            row = db.execute("SELECT time_start, time_end FROM user_telegram_sessions WHERE id = ?", (session_id,)).fetchone()
+            # Добавили проверку schedule_enabled
+            row = db.execute("SELECT schedule_enabled, time_start, time_end FROM user_telegram_sessions WHERE id = ?", (session_id,)).fetchone()
             
-            # Если тайминги не заданы или пустые — разрешаем парсинг круглосуточно (24/7)
-            if not row or not row['time_start'] or not row['time_end']:
+            # Если галочка "Расписание" не стоит или данных нет — разрешаем 24/7
+            if not row or not row['schedule_enabled']:
                 return True 
-
             
-            # Сдвигаем время сервера на +3 часа (Москва). Если у сервера уже московское время - уберите эту строку.
+            # Сдвигаем время сервера на +3 часа (Москва).
             current_time = (datetime.utcnow() + timedelta(hours=3)).time()
             
-            # Преобразуем строки из базы (например "09:00") в объекты времени
             start_time = datetime.strptime(row['time_start'], '%H:%M').time()
             end_time = datetime.strptime(row['time_end'], '%H:%M').time()
 
-            # Сравниваем время
             if start_time <= end_time:
-                # Дневная смена: например, с 09:00 до 18:00
                 return start_time <= current_time <= end_time
             else:
-                # Ночная смена: например, с 22:00 до 08:00 (переход через полночь)
                 return current_time >= start_time or current_time <= end_time
 
     except Exception as e:
-        print(f"Ошибка проверки тайминга для сессии {session_id}: {e}")
-        # В случае сбоя лучше сохранить прайс, чем потерять его
+        logger.error(f"Ошибка проверки тайминга для сессии {session_id}: {e}")
         return True
 
 def delayed_messages_scheduler():
