@@ -47,6 +47,23 @@ qr_sessions = {}           # session_id -> данные для QR
 listener_locks = {}        # блокировки для каждого session_id
 user_loops = {}            # session_id -> asyncio event loop
 
+
+import asyncio
+import logging
+
+# --- ПОДАВЛЕНИЕ СИСТЕМНЫХ ОШИБОК TELETHON ПРИ ЗАКРЫТИИ ПОТОКОВ ---
+def custom_exception_handler(loop, context):
+    msg = context.get("exception", context["message"])
+    # Игнорируем ошибки, связанные с закрытым циклом событий или GeneratorExit
+    if isinstance(msg, (RuntimeError, GeneratorExit)) or "Task was destroyed" in str(msg) or "Event loop is closed" in str(msg):
+        return
+    # Для остальных ошибок используем стандартный обработчик
+    loop.default_exception_handler(context)
+
+# Применяем этот обработчик ко всем новым потокам
+# (Вам нужно добавить `loop.set_exception_handler(custom_exception_handler)` 
+# в функцию, где вы создаете новый цикл `loop = asyncio.new_event_loop()`)
+
 import functools
 from flask import session, redirect, url_for
 from datetime import datetime, timedelta, timezone
@@ -75,6 +92,7 @@ def ensure_event_loop():
     try:
         return asyncio.get_running_loop()
     except RuntimeError:
+        loop = asyncio.new_event_loop()
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
@@ -172,56 +190,71 @@ def get_product_messages(prod_id):
     user_id = session['user_id']
     db = get_db()
     
+    # 1. Получаем синонимы товара
     prod = db.execute("SELECT synonyms FROM products WHERE id = ? AND user_id = ?", (prod_id, user_id)).fetchone()
     if not prod or not prod['synonyms']:
         return jsonify({'proposed': [], 'confirmed': []})
     
-    # --- УМНАЯ ОЧИСТКА ТЕКСТА ---
-   # --- УМНАЯ ОЧИСТКА ТЕКСТА ---
-    # --- УМНАЯ ОЧИСТКА ТЕКСТА ---
+    # --- УМНАЯ ОЧИСТКА (превращает строку в набор слов) ---
+    # --- УЛУЧШЕННАЯ ОЧИСТКА ---
     import re
     def clean_for_search(text):
-        if not text: return ""
-        t = re.sub(r'\s+', ' ', text.replace('\xa0', ' ')).strip().lower()
+        if not text: return set()
+        
+        # ДОБАВЛЯЕМ '*' (звездочку) в список удаляемых символов
+        # Также добавили '.', если вдруг поставщик пишет "17.512"
+        t = re.sub(r'[()*.[\]{},;!|/+\-]', ' ', text)
+        
+        # Убираем лишние пробелы и неразрывные пробелы
+        t = re.sub(r'\s+', ' ', t.replace('\xa0', ' ')).strip().lower()
+        
+        # Решаем проблему кириллицы/латиницы
         t = t.translate(str.maketrans('асеокрх', 'aceokpx'))
-        return t
+        
+        # Возвращаем набор чистых слов
+        return set(t.split())
 
-    synonyms = [clean_for_search(s) for s in prod['synonyms'].split(',') if s.strip()]
-    # ----------------------------
-    
-    # 1. Получаем все сообщения пользователя + КАСТОМНЫЕ ИМЕНА ИЗ ПАРСЕРА
-    all_msgs = db.execute("""
-        SELECT m.*, tc.custom_name 
+    # Подготовка синонимов (разбиваем на сеты слов)
+    synonyms_as_word_sets = []
+    for s in prod['synonyms'].split(','):
+        if s.strip():
+            words = clean_for_search(s)
+            if words:
+                synonyms_as_word_sets.append(words)
+
+    # --- ИСПРАВЛЕНИЕ: Получаем все последние сообщения (all_msgs) ---
+    # Без этого блока была ошибка "all_msgs is not defined"
+    all_msgs_rows = db.execute("""
+        SELECT m.id, m.text, m.date, m.chat_id, m.sender_name, m.chat_title, m.type, tc.custom_name
         FROM messages m
         LEFT JOIN tracked_chats tc ON m.chat_id = tc.chat_id AND m.user_id = tc.user_id
-        WHERE m.user_id = ? AND (m.is_blocked IS NULL OR m.is_blocked = 0) AND (m.is_delayed IS NULL OR m.is_delayed = 0)
-        ORDER BY m.date DESC
+        WHERE m.user_id = ? 
+        ORDER BY m.date DESC LIMIT 1000
     """, (user_id,)).fetchall()
-    
-    # Собираем самые свежие строки для каждого товара
+    all_msgs = [dict(r) for r in all_msgs_rows]
+
+    # --- ИСПРАВЛЕНИЕ: Собираем актуальные отпечатки (latest_fingerprints) ---
+    # Без этого блока была ошибка "latest_fingerprints is not defined"
     latest_fingerprints = {}
-    for row in all_msgs:
-        msg_id = row['id']
-        lines = row['text'].split('\n') if row['text'] else []
+    for msg in all_msgs:
+        if not msg['text']: continue
+        lines = msg['text'].split('\n')
         for i, line in enumerate(lines):
             if not line.strip(): continue
-            fp = get_fingerprint(row['chat_id'], row['sender_name'], line)
-            if fp not in latest_fingerprints:
+            fp = get_fingerprint(msg['chat_id'], msg['sender_name'], line)
+            if fp not in latest_fingerprints or msg['date'] > latest_fingerprints[fp]['date']:
                 latest_fingerprints[fp] = {
-                    'message_id': msg_id,
-                    'line_index': i,
                     'text': line,
-                    'date': row['date'],
-                    'chat_title': row['chat_title'],
-                    'sender_name': row['sender_name'],
-                    'custom_name': row['custom_name'] if 'custom_name' in row.keys() else None,
-                    'type': row['type'],
-                    'price': extract_price(line)
+                    'price': extract_price(line),
+                    'date': msg['date'],
+                    'message_id': msg['id'],
+                    'line_index': i
                 }
 
-    # 2. Подтвержденные: АВТО-ОБНОВЛЕНИЕ
+    # 2. Обработка ПОДТВЕРЖДЕННЫХ
     confirmed_rows = db.execute("""
-        SELECT pm.id as pm_id, pm.group_id, pm.message_id, m.chat_title, m.chat_id, m.sender_name, pm.extracted_price, m.text, m.date, pm.line_index, tc.custom_name, m.type
+        SELECT pm.id as pm_id, pm.group_id, pm.message_id, m.chat_title, m.chat_id, m.sender_name, 
+               pm.extracted_price, m.text, m.date, pm.line_index, tc.custom_name, m.type
         FROM product_messages pm
         JOIN messages m ON pm.message_id = m.id
         LEFT JOIN tracked_chats tc ON m.chat_id = tc.chat_id AND m.user_id = tc.user_id
@@ -230,8 +263,8 @@ def get_product_messages(prod_id):
     
     confirmed_raw = []
     confirmed_fingerprints = set()
-    
-    has_updates = False # Флаг: были ли реальные изменения?
+    has_updates = False 
+
     for r in confirmed_rows:
         d = dict(r)
         if d['line_index'] != -1 and d['text']:
@@ -246,22 +279,16 @@ def get_product_messages(prod_id):
                     d['text'] = latest['text']
                     d['extracted_price'] = latest['price']
                     d['date'] = latest['date'] 
-                    current_id = d.get('pm_id') or d.get('id')
-
+                    current_id = d.get('pm_id')
                     try:
                         db.execute("UPDATE product_messages SET message_id=?, line_index=?, extracted_price=? WHERE id=?",
                                    (latest['message_id'], latest['line_index'], latest['price'], current_id))
                         has_updates = True
-                    except sqlite3.IntegrityError:
-                        # Если дубликат существует, удаляем лишнюю привязку
-                        if current_id:
-                            db.execute("DELETE FROM product_messages WHERE id=?", (current_id,))
-                            has_updates = True
+                    except: pass
                 else:
                     d['text'] = orig_line
         confirmed_raw.append(d)
         
-    # Вызываем коммит и сокет ТОЛЬКО если были изменения
     if has_updates:
         db.commit()
         notify_clients()
@@ -272,34 +299,38 @@ def get_product_messages(prod_id):
         if g_id not in grouped_confirmed or d['date'] > grouped_confirmed[g_id]['date']:
             grouped_confirmed[g_id] = d
     
-    confirmed = list(grouped_confirmed.values())
-    confirmed.sort(key=lambda x: x['date'], reverse=True)
+    confirmed = sorted(list(grouped_confirmed.values()), key=lambda x: x['date'], reverse=True)
     
-    # 3. Предложенные: СКЛЕИВАНИЕ ДУБЛИКАТОВ
+    # 3. Обработка ПРЕДЛОЖЕННЫХ (склеивание дубликатов и поиск по словам)
     proposed_list = []
     seen_fps = set()
     
     for row in all_msgs:
-        msg_id = row['id']
         lines = row['text'].split('\n') if row['text'] else []
         for i, line in enumerate(lines):
             if not line.strip(): continue
             fp = get_fingerprint(row['chat_id'], row['sender_name'], line)
             
-            # Если мы уже добавили свежую версию этой строки, или она уже подтверждена - пропускаем
             if fp in seen_fps or fp in confirmed_fingerprints:
                 continue
             
-            seen_fps.add(fp)
-            text_lower = clean_for_search(line)
+            # --- ЛОГИКА ЖЕСТКОГО ПОИСКА ПО СЛОВАМ ---
+            line_words = clean_for_search(line)
+            is_match = False
+            for syn_set in synonyms_as_word_sets:
+                # Если ВСЕ слова из синонима есть в строке поставщика
+                if syn_set.issubset(line_words):
+                    is_match = True
+                    break
             
-            if any(syn in text_lower for syn in synonyms):
+            if is_match:
+                seen_fps.add(fp)
                 proposed_list.append({
-                    'message_id': msg_id,
+                    'message_id': row['id'],
                     'line_index': i,
                     'chat_title': row['chat_title'],
                     'sender_name': row['sender_name'],
-                    'custom_name': row['custom_name'] if 'custom_name' in row.keys() else None,
+                    'custom_name': row.get('custom_name'),
                     'type': row['type'],
                     'match_line': line,
                     'suggested_price': extract_price(line),
@@ -308,7 +339,6 @@ def get_product_messages(prod_id):
     
     proposed_list.sort(key=lambda x: x['date'], reverse=True)
     return jsonify({'proposed': proposed_list, 'confirmed': confirmed})
-
 
 import re
 
@@ -773,6 +803,7 @@ def init_db():
             ("api_clients", "publish_enabled INTEGER DEFAULT 0"),
             ("api_clients", "userbot_id INTEGER"),
             ("api_clients", "publish_template TEXT"),
+            ("publications", "user_id INTEGER"),
             ("api_clients", "folders TEXT"),
             ("api_clients", "publish_interval INTEGER DEFAULT 60"),
             ("users", "session_token TEXT"),
@@ -1902,35 +1933,54 @@ def admin_required(f):
 
 # ---------- Фоновый слушатель сообщений ----------
 def stop_message_listener(session_id):
-    if session_id in user_clients:
-        thread, client, uid = user_clients[session_id]
+    """
+    Безопасно останавливает сессию юзербота, закрывает соединение 
+    и очищает ресурсы в памяти и базе данных.
+    """
+    # 1. Извлекаем данные клиента, не удаляя их сразу
+    client_info = user_clients.get(session_id)
+    
+    if client_info:
+        _, client, _ = client_info
         loop = user_loops.get(session_id)
-        
+
+        # Пытаемся корректно закрыть соединение Telethon
         if loop and loop.is_running():
-            # Обертка: заставляем код отключения работать ВНУТРИ асинхронного потока бота, 
-            # а не в потоке Flask
-            async def disconnect_client():
+            async def safe_disconnect():
                 try:
+                    # Отключаемся от серверов Telegram
                     await client.disconnect()
                 except Exception as e:
-                    logging.error(f"Ошибка при отключении сессии {session_id}: {e}")
-            
-            # Безопасно передаем задачу в цикл событий юзербота
-            asyncio.run_coroutine_threadsafe(disconnect_client(), loop)
-            
-        del user_clients[session_id]
-        user_loops.pop(session_id, None)
-        
-    if session_id in background_tasks:
-        del background_tasks[session_id]
-        
-    with app.app_context():
-        db = get_db()
-        db.execute("UPDATE user_telegram_sessions SET status = 'inactive' WHERE id = ?", (session_id,))
-        db.commit()
-        notify_clients()
-    
-    logging.info(f"Слушатель для сессии {session_id} остановлен")
+                    logging.debug(f"Сессия {session_id}: принудительное закрытие соединения ({e})")
+
+            try:
+                # Отправляем задачу в асинхронный поток
+                asyncio.run_coroutine_threadsafe(safe_disconnect(), loop)
+            except RuntimeError:
+                # Возникает, если цикл событий уже закрыт
+                pass
+
+    # 2. Очищаем все глобальные словари (удаляем ссылки из памяти)
+    user_clients.pop(session_id, None)
+    user_loops.pop(session_id, None)
+    background_tasks.pop(session_id, None)
+
+    # 3. Обновляем статус в базе данных
+    try:
+        with app.app_context():
+            db = get_db()
+            db.execute(
+                "UPDATE user_telegram_sessions SET status = 'inactive' WHERE id = ?", 
+                (session_id,)
+            )
+            db.commit()
+            # Уведомляем фронтенд через WebSocket (если используется)
+            if 'notify_clients' in globals():
+                notify_clients()
+                
+        logging.info(f"Сессия {session_id}: слушатель успешно остановлен")
+    except Exception as e:
+        logging.error(f"Ошибка БД при остановке сессии {session_id}: {e}")
 
 @app.route('/logo.svg')
 def serve_logo():
@@ -2003,6 +2053,7 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
             return
 
         def listener():
+            loop = asyncio.new_event_loop()
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             session_file = f'sessions/user_{user_id}_{session_id}'
@@ -2429,6 +2480,7 @@ def get_qr():
     def qr_worker():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        loop = asyncio.new_event_loop()
         client = TelegramClient(session_file, int(api_id), api_hash)
 
         async def _run():
@@ -2790,7 +2842,8 @@ def get_messages():
 @login_required
 def get_publications():
     db = get_db()
-    pubs = db.execute("SELECT * FROM publications").fetchall()
+    user_id = session['user_id'] # Получаем ID текущего пользователя
+    pubs = db.execute("SELECT * FROM publications WHERE user_id = ?", (user_id,)).fetchall() # Фильтруем
     return jsonify([dict(p) for p in pubs])
 
 @app.route('/api/publications', methods=['POST'])
@@ -2815,11 +2868,11 @@ def save_publication():
               data.get('template'), allowed_items_json, markup_type, markup_value, rounding, pub_id))
     else:
         db.execute("""
-            INSERT INTO publications (name, is_active, interval_min, chat_id, message_id, userbot_id, template, allowed_items, markup_type, markup_value, rounding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO publications (name, is_active, interval_min, chat_id, message_id, userbot_id, template, allowed_items, markup_type, markup_value, rounding, user_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (data.get('name'), data.get('is_active', 0), data.get('interval_min', 60), 
               data.get('chat_id'), data.get('message_id'), data.get('userbot_id'), 
-              data.get('template'), allowed_items_json, markup_type, markup_value, rounding))
+              data.get('template'), allowed_items_json, markup_type, markup_value, rounding,session['user_id']))
         # Получаем ID только что созданной публикации
         pub_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
         
