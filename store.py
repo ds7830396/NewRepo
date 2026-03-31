@@ -624,6 +624,18 @@ def init_db():
     with app.app_context():
         db = get_db()
         db.execute('''
+        CREATE TABLE IF NOT EXISTS pub_markups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pub_id INTEGER NOT NULL,
+                    folder_id INTEGER DEFAULT 0,
+                    markup_type TEXT DEFAULT 'percent',
+                    markup_value REAL DEFAULT 0,
+                    rounding INTEGER DEFAULT 100,
+                    FOREIGN KEY(pub_id) REFERENCES publications(id) ON DELETE CASCADE,
+                    UNIQUE(pub_id, folder_id)
+                )
+    ''')
+        db.execute('''
         CREATE TABLE IF NOT EXISTS publications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
@@ -753,6 +765,9 @@ def init_db():
             ("api_clients", "publish_interval INTEGER DEFAULT 60"),
             ("users", "session_token TEXT"),
             ("excel_configs", "is_grouped INTEGER DEFAULT 0"),
+            ("publications", "markup_type TEXT DEFAULT 'percent'"), # <--- НОВОЕ
+            ("publications", "markup_value REAL DEFAULT 0"),        # <--- НОВОЕ
+            ("publications", "rounding INTEGER DEFAULT 100"),
             ("excel_configs", "sku_col INTEGER DEFAULT -1"),
             ("excel_configs", "source_type TEXT DEFAULT 'file'"),       # 'file' или 'google_sheet'
             ("excel_configs", "sheet_url TEXT"),                        # Ссылка на таблицу
@@ -1207,15 +1222,16 @@ def publish_scheduler():
                     try: allowed_items = json.loads(pub['allowed_items']) 
                     except: pass
                     
-                    if not allowed_items: continue # Ничего не отмечено - пропускаем
+                    if not allowed_items: continue
                     
-                    # Достаем все подтвержденные цены напрямую для пользователя
-                    products_raw = db.execute("""
-                        SELECT p.id, p.name,
-                               (SELECT pm.extracted_price FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' AND pm.is_actual = 1 ORDER BY m.date DESC LIMIT 1) as price
-                        FROM products p
-                        WHERE p.user_id = ?
-                    """, (user_id,)).fetchall()
+                    # ---- НОВОЕ: ДОСТАЕМ НАЦЕНКИ ----
+                    markups_raw = db.execute("SELECT folder_id, markup_type, markup_value, rounding FROM pub_markups WHERE pub_id=?", (pub_id,)).fetchall()
+                    markups = {}
+                    default_markup = {'markup_type': 'percent', 'markup_value': 0, 'rounding': 100}
+                    for m in markups_raw:
+                        if m['folder_id'] == 0: default_markup = dict(m)
+                        else: markups[m['folder_id']] = dict(m)
+                    # --------------------------------
                     
                     final_products = []
                     
@@ -1224,13 +1240,12 @@ def publish_scheduler():
                         if not allowed_suppliers: 
                             continue
                         
-                        # Создаем плейсхолдеры (?,?,?) для SQL IN (...)
                         placeholders = ','.join(['?'] * len(allowed_suppliers))
-                        
-                        # Ищем цену на этот товар ТОЛЬКО среди тех поставщиков, на которых поставили галочку!
                         query_params = [int(p_id_str)] + allowed_suppliers
+                        
+                        # ВАЖНО: Добавлено p.folder_id в SELECT
                         price_row = db.execute(f"""
-                            SELECT pm.extracted_price, p.name 
+                            SELECT pm.extracted_price, p.name, p.folder_id 
                             FROM product_messages pm 
                             JOIN messages m ON pm.message_id = m.id 
                             JOIN products p ON p.id = pm.product_id
@@ -1242,9 +1257,23 @@ def publish_scheduler():
                         """, query_params).fetchone()
                         
                         if price_row and price_row['extracted_price'] is not None:
+                            # -------- ПРИМЕНЯЕМ НАЦЕНКУ ПО ПАПКАМ ---------
+                            base_price = float(price_row['extracted_price'])
+                            f_id = price_row['folder_id'] or 0
+                            mk = markups.get(f_id, default_markup)
+                            
+                            if mk['markup_type'] == 'percent':
+                                final_price = base_price * (1 + mk['markup_value'] / 100)
+                            else:
+                                final_price = base_price + mk['markup_value']
+                                
+                            rnd = mk['rounding']
+                            if rnd > 0:
+                                final_price = math.ceil(final_price / rnd) * rnd
+
                             final_products.append({
                                 'name': price_row['name'], 
-                                'price': int(price_row['extracted_price'])
+                                'price': int(final_price)
                             })
                     
                     if not final_products: continue
@@ -1882,6 +1911,39 @@ def delete_excel_chat_configs(chat_id):
     except Exception as e:
         print(f"Ошибка при удалении файла: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/publications/<int:pub_id>/markups', methods=['GET', 'POST'])
+@login_required
+def manage_pub_markups(pub_id):
+    db = get_db()
+    if request.method == 'GET':
+        markups = db.execute("""
+            SELECT pm.*, f.name as folder_name 
+            FROM pub_markups pm 
+            LEFT JOIN folders f ON pm.folder_id = f.id 
+            WHERE pm.pub_id=?
+        """, (pub_id,)).fetchall()
+        return jsonify([dict(m) for m in markups])
+    
+    data = request.json
+    folder_id = data.get('folder_id') or 0
+    db.execute("""
+        INSERT INTO pub_markups (pub_id, folder_id, markup_type, markup_value, rounding) 
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(pub_id, folder_id) DO UPDATE SET 
+        markup_type=excluded.markup_type, markup_value=excluded.markup_value, rounding=excluded.rounding
+    """, (pub_id, folder_id, data['markup_type'], data['markup_value'], data['rounding']))
+    db.commit()
+    return jsonify({'success': True})
+
+@app.route('/api/pub_markups/<int:markup_id>', methods=['DELETE'])
+@login_required
+def delete_pub_markup(markup_id):
+    db = get_db()
+    db.execute("DELETE FROM pub_markups WHERE id=? AND folder_id != 0", (markup_id,))
+    db.commit()
+    return jsonify({'success': True})
+
 
 def start_message_listener(session_id, user_id, api_id, api_hash):
     with listener_locks.setdefault(session_id, threading.Lock()):
@@ -2687,28 +2749,31 @@ def save_publication():
     db = get_db()
     pub_id = data.get('id')
     
-    # Превращаем объект с галочками в строку (JSON) для базы
     allowed_items_json = json.dumps(data.get('allowed_items', {}))
+    markup_type = data.get('markup_type', 'percent')
+    markup_value = float(data.get('markup_value', 0))
+    rounding = int(data.get('rounding', 100))
     
     if pub_id:
         db.execute("""
             UPDATE publications 
-            SET name=?, is_active=?, interval_min=?, chat_id=?, message_id=?, userbot_id=?, template=?, allowed_items=?
+            SET name=?, is_active=?, interval_min=?, chat_id=?, message_id=?, userbot_id=?, template=?, allowed_items=?, markup_type=?, markup_value=?, rounding=?
             WHERE id=?
         """, (data.get('name'), data.get('is_active', 0), data.get('interval_min', 60), 
               data.get('chat_id'), data.get('message_id'), data.get('userbot_id'), 
-              data.get('template'), allowed_items_json, pub_id))
+              data.get('template'), allowed_items_json, markup_type, markup_value, rounding, pub_id))
     else:
         db.execute("""
-            INSERT INTO publications (name, is_active, interval_min, chat_id, message_id, userbot_id, template, allowed_items)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO publications (name, is_active, interval_min, chat_id, message_id, userbot_id, template, allowed_items, markup_type, markup_value, rounding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (data.get('name'), data.get('is_active', 0), data.get('interval_min', 60), 
               data.get('chat_id'), data.get('message_id'), data.get('userbot_id'), 
-              data.get('template'), allowed_items_json))
+              data.get('template'), allowed_items_json, markup_type, markup_value, rounding))
         
     db.commit()
     notify_clients()
     return jsonify({'success': True})
+
 
 @app.route('/api/publications/<int:pub_id>', methods=['DELETE'])
 @login_required
@@ -3981,7 +4046,7 @@ TEMPLATE = """
             </div>
 
 
-              <div id="telegram-section" class="section" style="display: none;">
+            <div id="telegram-section" class="section" style="display: none;">
     <h2 style="margin-top: 0; padding-left: 15px;">✈️ Управление Telegram</h2>
     
     <div style="display:flex; gap:20px; align-items:flex-start; margin-top:16px; flex-wrap:wrap; padding-left: 15px;">
@@ -4036,7 +4101,7 @@ TEMPLATE = """
                         </div>
                     </div>
 
-                    <div style="flex:1; min-width:350px;">
+                    <div style="flex:1; min-width:300px;">
                         <h4 style="color:#2ecc71; margin-bottom:10px;">Содержимое прайса</h4>
                         <p style="color:#aaa; font-size:12px; margin-bottom:15px;">Выберите категории и товары, которые войдут в эту публикацию.</p>
                         
@@ -4044,11 +4109,57 @@ TEMPLATE = """
                         </div>
                     </div>
                     
+                    <div style="flex:1; min-width:350px;">
+                        <h4 style="color:#f39c12; margin-bottom:10px;">Настройки наценок</h4>
+                        
+                        <div id="pub-markups-warning" style="color:#aaa; font-size:13px; margin-bottom:15px; display:none; background: #2a2a2a; padding: 15px; border-radius: 6px; border: 1px dashed #f39c12;">
+                            ⚠️ Сначала сохраните публикацию (кнопка в самом низу), чтобы появилась возможность настраивать наценки.
+                        </div>
+                        
+                        <div id="pub-markups-content">
+                            <form id="pub-markup-form" style="display:flex; flex-wrap:wrap; gap:10px; margin-bottom: 20px; align-items:flex-end;">
+                                <div class="form-group">
+                                    <label>Категория (Папка)</label>
+                                    <select id="pub-markup-folder" style="padding:8px; background:#2a2a2a; border:1px solid #3a3a3a; color:#fff; border-radius:4px; max-width: 150px;">
+                                        <option value="0">Базовая</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>Тип</label>
+                                    <select id="pub-markup-type" style="padding:8px; background:#2a2a2a; border:1px solid #3a3a3a; color:#fff; border-radius:4px;">
+                                        <option value="percent">Процент (%)</option>
+                                        <option value="fixed">Фикс (руб)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>Значение</label>
+                                    <input type="number" step="0.01" id="pub-markup-value" value="0" style="width:70px; padding:8px; background:#2a2a2a; border:1px solid #3a3a3a; color:#fff; border-radius:4px;">
+                                </div>
+                                <div class="form-group">
+                                    <label>Округление</label>
+                                    <select id="pub-markup-rounding" style="padding:8px; background:#2a2a2a; border:1px solid #3a3a3a; color:#fff; border-radius:4px;">
+                                        <option value="1">1 руб</option>
+                                        <option value="10">10 руб</option>
+                                        <option value="50">50 руб</option>
+                                        <option value="100" selected>100 руб</option>
+                                        <option value="500">500 руб</option>
+                                        <option value="1000">1000 руб</option>
+                                    </select>
+                                </div>
+                                <button type="button" class="save-btn" onclick="savePubMarkup()">➕</button>
+                            </form>
+                            <table class="simple-table" style="font-size: 13px;">
+                                <thead><tr><th>Папка</th><th>Наценка</th><th>Округление</th><th></th></tr></thead>
+                                <tbody id="pub-markups-tbody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    
                 </div>
                 <button class="save-btn" style="background:#2ecc71; width: 100%; margin-top:20px; height: 40px; font-size:16px;" onclick="savePublication()">💾 Сохранить публикацию</button>
             </div>
         </div>
-        </div>
+    </div>
 </div>
             <div id="reports-section" style="display: none;">  
                 <h2>📊 Сводный отчёт: Подтверждённые товары</h2>
@@ -8005,6 +8116,9 @@ async function openPublishEditor(pubId = null) {
             document.getElementById('pub_message_id').value = pubData.message_id || '';
             document.getElementById('pub_userbot_id').value = pubData.userbot_id || '';
             document.getElementById('pub_template').value = pubData.template || '';
+            document.getElementById('pub_markup_type').value = pubData.markup_type || 'percent'; // <--- НОВОЕ
+        document.getElementById('pub_markup_value').value = pubData.markup_value || 0;       // <--- НОВОЕ
+        document.getElementById('pub_rounding').value = pubData.rounding || 100;
             try { allowedItems = JSON.parse(pubData.allowed_items) || {}; } catch(e) {}
         }
     } else {
@@ -8014,10 +8128,36 @@ async function openPublishEditor(pubId = null) {
         document.getElementById('pub_interval').value = 60;
         document.getElementById('pub_chat_id').value = '';
         document.getElementById('pub_message_id').value = '';
+        document.getElementById('pub_markup_type').value = 'percent'; // <--- НОВОЕ
+        document.getElementById('pub_markup_value').value = 0;        // <--- НОВОЕ
+        document.getElementById('pub_rounding').value = 100;
         document.getElementById('pub_userbot_id').value = '';
         document.getElementById('pub_template').value = 'Цены на товары:';
     }
+    // Загрузка папок в выпадающий список
+    const folders = await cachedApiFetch('/api/folders/tree');
+    const folderSelect = document.getElementById('pub-markup-folder');
+    if (folderSelect) {
+        folderSelect.innerHTML = '<option value="0">Базовая (Для остальных)</option>';
+        function addOpt(list, level=0) {
+            list.forEach(f => {
+                if(f.name === 'По умолчанию') return;
+                folderSelect.innerHTML += `<option value="${f.id}">${'—'.repeat(level)} ${f.name}</option>`;
+                if(f.children) addOpt(f.children, level+1);
+            });
+        }
+        addOpt(folders);
+    }
 
+    // Переключение видимости (как в API - наценки доступны только после первого сохранения)
+    if (pubId) {
+        document.getElementById('pub-markups-content').style.display = 'block';
+        document.getElementById('pub-markups-warning').style.display = 'none';
+        loadPubMarkups(pubId);
+    } else {
+        document.getElementById('pub-markups-content').style.display = 'none';
+        document.getElementById('pub-markups-warning').style.display = 'block';
+    }
     // Рендерим дерево
     const treeData = await cachedApiFetch('/api/publish_tree_data'); // <-- Новый URL
 renderPublishTree(treeData.folders, treeData.products, treeData.suppliers, allowedItems); // <-- Передаем suppliers
@@ -8105,7 +8245,11 @@ async function savePublication() {
         message_id: document.getElementById('pub_message_id').value,
         userbot_id: document.getElementById('pub_userbot_id').value,
         template: document.getElementById('pub_template').value,
-        allowed_items: allowedItems // Сохранится как {"1": ["-100123", "456"], "2": ["-100123"]}
+        allowed_items: allowedItems,
+        // НОВЫЕ СТРОКИ НИЖЕ:
+        markup_type: document.getElementById('pub_markup_type').value,
+        markup_value: parseFloat(document.getElementById('pub_markup_value').value) || 0,
+        rounding: parseInt(document.getElementById('pub_rounding').value) || 100
     };
 
     if (!payload.name || !payload.chat_id || !payload.userbot_id) {
@@ -8139,9 +8283,40 @@ async function togglePublication(id, isActive) {
     loadPublications();
 }
 // --- ЛОГИКА ПАРСИНГА ЧУЖИХ API ---
+async function loadPubMarkups(pubId) {
+    const markups = await apiFetch(`/api/publications/${pubId}/markups`);
+    const tbody = document.getElementById('pub-markups-tbody');
+    tbody.innerHTML = markups.map(m => `
+        <tr>
+            <td><strong style="color:${m.folder_id === 0 ? '#f39c12' : '#fff'};">${m.folder_id === 0 ? 'Базовая (Для остальных)' : escapeHtml(m.folder_name)}</strong></td>
+            <td>${m.markup_value > 0 ? '+' : ''}${m.markup_value}${m.markup_type === 'percent' ? '%' : ' руб'}</td>
+            <td>До ${m.rounding}</td>
+            <td>
+                ${m.folder_id === 0 ? '<span style="color:#888; font-size:11px;">(Базовая)</span>' : `<button class="save-btn" style="background:#e74c3c; font-size:12px; padding:4px 8px;" onclick="deletePubMarkup(${m.id})">❌</button>`}
+            </td>
+        </tr>
+    `).join('');
+}
 
-// --- ЛОГИКА ПАРСИНГА ЧУЖИХ API ---
+async function savePubMarkup() {
+    const pubId = document.getElementById('pub_id').value;
+    if (!pubId) return;
+    const body = {
+        folder_id: parseInt(document.getElementById('pub-markup-folder').value),
+        markup_type: document.getElementById('pub-markup-type').value,
+        markup_value: parseFloat(document.getElementById('pub-markup-value').value),
+        rounding: parseInt(document.getElementById('pub-markup-rounding').value)
+    };
+    await apiFetch(`/api/publications/${pubId}/markups`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    loadPubMarkups(pubId);
+}
 
+async function deletePubMarkup(id) {
+    if(!confirm('Удалить эту наценку?')) return;
+    const pubId = document.getElementById('pub_id').value;
+    await apiFetch(`/api/pub_markups/${id}`, { method: 'DELETE' });
+    loadPubMarkups(pubId);
+}
 // --- ЛОГИКА ПАРСИНГА ЧУЖИХ API ---
 
 window.loadApiSources = async function() {
