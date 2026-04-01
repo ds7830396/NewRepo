@@ -269,9 +269,16 @@ def get_product_messages(prod_id):
             if not line.strip(): continue
             fp = get_fingerprint(msg['chat_id'], msg['sender_name'], line)
             if fp not in latest_fingerprints or msg['date'] > latest_fingerprints[fp]['date']:
+                # Ищем цену в текущей строке или на 1-2 строки ниже
+                price_val = extract_price(line)
+                if not price_val and i + 1 < len(lines):
+                    price_val = extract_price(lines[i+1])
+                if not price_val and i + 2 < len(lines):
+                    price_val = extract_price(lines[i+2])
+
                 latest_fingerprints[fp] = {
                     'text': line,
-                    'price': extract_price(line),
+                    'price': price_val,
                     'date': msg['date'],
                     'message_id': msg['id'],
                     'line_index': i
@@ -351,6 +358,14 @@ def get_product_messages(prod_id):
             
             if is_match:
                 seen_fps.add(fp)
+                
+                # Ищем цену в текущей строке или на 1-2 строки ниже
+                s_price = extract_price(line)
+                if not s_price and i + 1 < len(lines):
+                    s_price = extract_price(lines[i+1])
+                if not s_price and i + 2 < len(lines):
+                    s_price = extract_price(lines[i+2])
+                
                 proposed_list.append({
                     'message_id': row['id'],
                     'line_index': i,
@@ -359,7 +374,7 @@ def get_product_messages(prod_id):
                     'custom_name': row.get('custom_name'),
                     'type': row['type'],
                     'match_line': line,
-                    'suggested_price': extract_price(line),
+                    'suggested_price': s_price,
                     'date': row['date']
                 })
     
@@ -536,12 +551,18 @@ def get_all_confirmed():
             if not line.strip(): continue
             fp = get_fingerprint(row['chat_id'], row['sender_name'], line)
             if fp not in latest_fingerprints:
+                price_val = extract_price(line)
+                if not price_val and i + 1 < len(lines):
+                    price_val = extract_price(lines[i+1])
+                if not price_val and i + 2 < len(lines):
+                    price_val = extract_price(lines[i+2])
+
                 latest_fingerprints[fp] = {
                     'message_id': row['id'],
                     'line_index': i,
                     'text': line,
                     'date': row['date'],
-                    'price': extract_price(line),
+                    'price': price_val,
                     'telegram_message_id': row['telegram_message_id'],
                     'type': row['type']
                 }
@@ -2127,9 +2148,14 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                         # Если привязка идет ко всему сообщению (line_index = -1)
                         if line_idx == -1:
                             text_lower = parsed_text.lower()
+                            # Проверяем, остался ли товар в этой строке
                             if any(syn in text_lower for syn in synonyms):
                                 is_actual = 1
-                                new_price = extract_price(parsed_text)
+                                new_price = extract_price(edited_line)
+                                if not new_price and line_idx + 1 < len(lines):
+                                    new_price = extract_price(lines[line_idx+1])
+                                if not new_price and line_idx + 2 < len(lines):
+                                    new_price = extract_price(lines[line_idx+2])
                                 
                         # Если привязка идет к конкретной строке
                         else:
@@ -2204,7 +2230,29 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                 sender = await event.get_sender()
                 sender_name = f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip() or "Unknown"
 
-                # ================= МАГИЯ EXCEL =================
+                # --- НОВОЕ ПРАВИЛО: ИЗОЛЯЦИЯ ПАРСИНГА БОТОВ ---
+                # Если сообщение пришло в личку и у отправителя есть username (скорее всего это бот)
+                if event.is_private:
+                    sender_username = getattr(sender, 'username', None)
+                    if sender_username:
+                        bot_username_clean = sender_username.lower()
+                        bot_username_at = f"@{bot_username_clean}"
+                        
+                        with app.app_context():
+                            local_db = get_db()
+                            # Проверяем, числится ли этот бот в списке "Автоматизации"
+                            bot_records = local_db.execute(
+                                "SELECT userbot_id FROM interaction_bots WHERE user_id = ? AND (LOWER(bot_username) = ? OR LOWER(bot_username) = ?)", 
+                                (user_id, bot_username_clean, bot_username_at)
+                            ).fetchall()
+                            
+                            if bot_records:
+                                # Бот найден в автоматизации. Разрешаем парсить ТОЛЬКО тому аккаунту, к которому он привязан!
+                                allowed_sessions = [r['userbot_id'] for r in bot_records]
+                                if session_id not in allowed_sessions:
+                                    return # Бот пишет на другой аккаунт (или сообщение поймал "левый" юзербот) -> игнорируем!
+                # ----------------------------------------------
+
                 parsed_text = await parse_excel_message(client, message, chat_id, user_id)
                 
                 # Если после парсинга текста нет (например, пустой Excel или не настроен), прерываем
@@ -2262,6 +2310,10 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                                         if any(syn in line.lower() for syn in synonyms):
                                             match_found = True
                                             new_price = extract_price(line)
+                                            if not new_price and i + 1 < len(lines):
+                                                new_price = extract_price(lines[i+1])
+                                            if not new_price and i + 2 < len(lines):
+                                                new_price = extract_price(lines[i+2])
                                             line_idx = i
                                             break
                                 
@@ -3643,11 +3695,12 @@ TEMPLATE = """
     box-sizing: border-box;
 }
 .sidebar { 
-            width: 280px; min-width: 200px; max-width: 600px; /* Размеры панели */
+            width: max-content; /* АВТОМАТИЧЕСКИ растягивается под самый длинный текст */
+            min-width: 200px; 
+            max-width: 50vw; /* Защита: не больше половины экрана */
             background: #2a2a2a; border-radius: 8px; padding: 16px;
             border: 1px solid #3a3a3a; height: fit-content; 
-            resize: horizontal; /* ПОЗВОЛЯЕТ РАСТЯГИВАТЬ МЫШКОЙ */
-            overflow: auto; /* ДОБАВЛЯЕТ ПОЛОСУ ПРОКРУТКИ */
+            overflow-x: auto; /* Добавляет скролл, если название ну очень длинное */
         }
         .sidebar h3 { color: #ccc; margin-bottom: 12px; font-size: 16px; }
         .folder-tree { list-style: none; margin-bottom: 16px; 
@@ -3811,7 +3864,7 @@ TEMPLATE = """
 
         <div id="products-section" style="display: none;">
     <div style="display: flex; gap: 20px; align-items: flex-start;">
-        <div class="sidebar" id="products-sidebar" style="width: 280px; min-width: 200px; background: #2a2a2a; border-radius: 8px; padding: 16px; border: 1px solid #3a3a3a;">
+        <div class="sidebar" id="products-sidebar" style="width: max-content; min-width: 200px; max-width: 50vw; background: #2a2a2a; border-radius: 8px; padding: 16px; border: 1px solid #3a3a3a; overflow-x: auto;">
             <h3 style="color: #ccc; margin-bottom: 12px; font-size: 16px;">📁 Категории товаров</h3>
             <ul class="folder-tree" id="products-folder-tree"></ul>
         </div>
@@ -3982,6 +4035,7 @@ TEMPLATE = """
                                 <option value="price_asc">Сначала дешевле (Лучшая цена)</option>
                                 <option value="price_desc">Сначала дороже</option>
                                 <option value="seller_asc">По продавцу (А-Я)</option>
+                                <option value="name_asc">По названию (А-Я)</option>
                             </select>
                         </div>
                     </div>
@@ -6717,6 +6771,7 @@ function buildFolderItem(folder, parentElement) {
         if (sortVal === 'price_asc') return (a.extracted_price || 0) - (b.extracted_price || 0);
         if (sortVal === 'price_desc') return (b.extracted_price || 0) - (a.extracted_price || 0);
         if (sortVal === 'seller_asc') return (`${a.sender_name} ${a.chat_title}`).localeCompare(`${b.sender_name} ${b.chat_title}`);
+        if (sortVal === 'name_asc') return (a.product_name || '').localeCompare(b.product_name || '');
         return new Date(b.date) - new Date(a.date);
     });
 
@@ -9008,6 +9063,11 @@ def public_api_catalog():
             
     categories = [{'id': f['id'], 'name': f['name'], 'parent_id': f['parent_id']} 
                   for f in folders_raw if f['id'] in folders_to_keep]
+                  
+    # --- СОРТИРОВКА ТОВАРОВ И КАТЕГОРИЙ ПО ИМЕНИ (А-Я) ---
+    products.sort(key=lambda x: (x['name'] or '').lower())
+    categories.sort(key=lambda x: (x['name'] or '').lower())
+    # -----------------------------------------------------
         
     return jsonify({
         'categories': categories,
@@ -9499,6 +9559,10 @@ def delayed_messages_scheduler():
                                             if any(syn in line.lower() for syn in synonyms):
                                                 match_found = True
                                                 new_price = extract_price(line)
+                                                if not new_price and i + 1 < len(lines):
+                                                    new_price = extract_price(lines[i+1])
+                                                if not new_price and i + 2 < len(lines):
+                                                    new_price = extract_price(lines[i+2])
                                                 line_idx = i
                                                 break
                                      
