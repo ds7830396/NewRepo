@@ -109,7 +109,15 @@ def ensure_event_loop():
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
-        db = g._database = sqlite3.connect(app.config['DATABASE'])
+        # 1. Добавляем timeout=20. Если база занята, поток подождет 20 секунд, а не упадет сразу
+        db = g._database = sqlite3.connect(app.config['DATABASE'], timeout=20)
+        
+        # 2. Включаем режим WAL для параллельной работы
+        db.execute("PRAGMA journal_mode=WAL;")
+        
+        # 3. Синхронизация (опционально для ускорения записи)
+        db.execute("PRAGMA synchronous=NORMAL;")
+        
         db.row_factory = sqlite3.Row
     return db
 
@@ -1435,7 +1443,8 @@ def get_catalog_for_client(client_id):
     
         
     if client['schedule_enabled']:
-        now = datetime.now().time()
+        from datetime import timedelta # На всякий случай импортируем, если не импортировано
+        now = (datetime.utcnow() + timedelta(hours=3)).time()
         start_time = datetime.strptime(client['time_start'], '%H:%M').time()
         end_time = datetime.strptime(client['time_end'], '%H:%M').time()
         
@@ -8881,7 +8890,8 @@ def public_api_catalog():
         return jsonify({'error': 'Неверный токен'}), 401
         
     if client['schedule_enabled']:
-        now = datetime.now().time()
+        from datetime import timedelta
+        now = (datetime.utcnow() + timedelta(hours=3)).time()
         start_time = datetime.strptime(client['time_start'], '%H:%M').time()
         end_time = datetime.strptime(client['time_end'], '%H:%M').time()
         is_active = start_time <= now <= end_time if start_time <= end_time else (now >= start_time or now <= end_time)
