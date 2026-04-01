@@ -6272,21 +6272,25 @@ function initInboxFilters() {
     });
 
     // 2. Кнопка Авторизоваться (при слетевшей сессии)
-    const addUserbotBtn = document.getElementById('add-userbot-btn');
-        if (addUserbotBtn) {
-            addUserbotBtn.addEventListener('click', () => {
-                const form = document.getElementById('bot-form-container');
-                form.style.display = form.style.display === 'none' || form.style.display === '' ? 'block' : 'none';
-                
-                // НОВОЕ: Очищаем поля, чтобы форма "забыла" старый аккаунт
-                const sessionInput = document.getElementById('auth_session_id');
-                if (sessionInput) sessionInput.value = '';
-                document.getElementById('api_id').value = '';
-                document.getElementById('api_hash').value = '';
-                
-                form.scrollIntoView({ behavior: 'smooth' });
-            });
-        }
+    // 2. Кнопка Авторизоваться (при слетевшей сессии)
+    container.querySelectorAll('.reauth-bot').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const form = document.getElementById('bot-form-container');
+            form.style.display = 'block';
+            form.scrollIntoView({ behavior: 'smooth' });
+            
+            // Подставляем старые данные
+            document.getElementById('api_id').value = btn.dataset.api;
+            document.getElementById('api_hash').value = btn.dataset.hash;
+            
+            // Записываем ID сессии в скрытое поле
+            const sessionInput = document.getElementById('auth_session_id');
+            if (sessionInput) sessionInput.value = btn.dataset.id;
+            
+            // Автоматически запускаем генерацию QR для этой сессии
+            await window.generateQR(btn.dataset.api, btn.dataset.hash, btn.dataset.id);
+        });
+    });
 
     // 3. Кнопка Удалить
     container.querySelectorAll('.delete-bot').forEach(btn => {
@@ -6298,7 +6302,7 @@ function initInboxFilters() {
             }
         });
     });
-}
+} // <--- Конец функции loadUserbots
     // НОВОЕ: Обработчик для кнопки переавторизации
         
     // НОВАЯ ФУНКЦИЯ ДЛЯ ОТПРАВКИ ТАЙМИНГА НА СЕРВЕР
