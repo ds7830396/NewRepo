@@ -2114,8 +2114,40 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                 message = event.message
                 if (not message.text and not message.document):
                     return
+                
                 chat = await event.get_chat()
+                
+                # --- ИГНОРИРУЕМ ИСХОДЯЩИЕ ТОЛЬКО ДЛЯ БОТОВ ---
+                if getattr(message, 'out', False) and event.is_private and getattr(chat, 'bot', False):
+                    return
+                # ---------------------------------------------
+                
                 chat_id = chat.id
+                
+                # --- ЖЕСТКАЯ ИЗОЛЯЦИЯ ПАРСИНГА БОТОВ (ДЛЯ РЕДАКТИРОВАНИЯ) ---
+                if event.is_private:
+                    sender_entity = await event.get_sender()
+                    if getattr(sender_entity, 'bot', False):
+                        bot_un = getattr(sender_entity, 'username', '')
+                        if not bot_un:
+                            try:
+                                entity = await client.get_entity(chat_id)
+                                bot_un = getattr(entity, 'username', '')
+                            except: pass
+                        
+                        bot_un_clean = bot_un.lower().replace('@', '') if bot_un else ''
+                        bot_un_at = f"@{bot_un_clean}" if bot_un_clean else ''
+                        
+                        with app.app_context():
+                            local_db = get_db()
+                            check_bot = local_db.execute(
+                                "SELECT id FROM interaction_bots WHERE user_id = ? AND userbot_id = ? AND (LOWER(bot_username) IN (?, ?))",
+                                (user_id, session_id, bot_un_clean, bot_un_at)
+                            ).fetchone()
+                            
+                            if not check_bot:
+                                return # Бот не привязан к этому аккаунту! Игнорируем.
+                # -----------------------------------------------------------------
                 
                 # --- МАГИЯ EXCEL ---
                 parsed_text = await parse_excel_message(client, message, chat_id, user_id)
@@ -2188,14 +2220,19 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
             async def handler(event):
                 message = event.message
                 
-                # Игнорируем исходящие, а также сообщения без текста И без документа
-                if (not message.text and not message.document) :
+                if (not message.text and not message.document):
                     return
+
+                chat = await event.get_chat()
+
+                # --- ИГНОРИРУЕМ ИСХОДЯЩИЕ ТОЛЬКО ДЛЯ БОТОВ ---
+                if getattr(message, 'out', False) and event.is_private and getattr(chat, 'bot', False):
+                    return
+                # ---------------------------------------------
 
                 allowed_now = is_parsing_allowed(session_id)
                 is_delayed = 0 if allowed_now else 1
-
-                chat = await event.get_chat()
+                
                 chat_id = chat.id
 
                 # Проверка: отслеживаем ли мы этот чат?
@@ -2230,28 +2267,28 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                 sender = await event.get_sender()
                 sender_name = f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip() or "Unknown"
 
-                # --- НОВОЕ ПРАВИЛО: ИЗОЛЯЦИЯ ПАРСИНГА БОТОВ ---
-                # Если сообщение пришло в личку и у отправителя есть username (скорее всего это бот)
-                if event.is_private:
-                    sender_username = getattr(sender, 'username', None)
-                    if sender_username:
-                        bot_username_clean = sender_username.lower()
-                        bot_username_at = f"@{bot_username_clean}"
+                # --- ЖЕСТКАЯ ИЗОЛЯЦИЯ ПАРСИНГА БОТОВ (ДЛЯ НОВЫХ СООБЩЕНИЙ) ---
+                if event.is_private and getattr(sender, 'bot', False):
+                    bot_un = getattr(sender, 'username', '')
+                    if not bot_un:
+                        try:
+                            entity = await client.get_entity(chat_id)
+                            bot_un = getattr(entity, 'username', '')
+                        except: pass
                         
-                        with app.app_context():
-                            local_db = get_db()
-                            # Проверяем, числится ли этот бот в списке "Автоматизации"
-                            bot_records = local_db.execute(
-                                "SELECT userbot_id FROM interaction_bots WHERE user_id = ? AND (LOWER(bot_username) = ? OR LOWER(bot_username) = ?)", 
-                                (user_id, bot_username_clean, bot_username_at)
-                            ).fetchall()
-                            
-                            if bot_records:
-                                # Бот найден в автоматизации. Разрешаем парсить ТОЛЬКО тому аккаунту, к которому он привязан!
-                                allowed_sessions = [r['userbot_id'] for r in bot_records]
-                                if session_id not in allowed_sessions:
-                                    return # Бот пишет на другой аккаунт (или сообщение поймал "левый" юзербот) -> игнорируем!
-                # ----------------------------------------------
+                    bot_un_clean = bot_un.lower().replace('@', '') if bot_un else ''
+                    bot_un_at = f"@{bot_un_clean}" if bot_un_clean else ''
+                    
+                    with app.app_context():
+                        local_db = get_db()
+                        check_bot = local_db.execute(
+                            "SELECT id FROM interaction_bots WHERE user_id = ? AND userbot_id = ? AND (LOWER(bot_username) IN (?, ?))",
+                            (user_id, session_id, bot_un_clean, bot_un_at)
+                        ).fetchone()
+                        
+                        if not check_bot:
+                            return # Бот не привязан к этому аккаунту! Игнорируем.
+                # -------------------------------------------------------------
 
                 parsed_text = await parse_excel_message(client, message, chat_id, user_id)
                 
