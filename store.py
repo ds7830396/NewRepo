@@ -496,12 +496,21 @@ def manage_products():
     user_id = session['user_id']
     db = get_db()
     if request.method == 'GET':
-        products = db.execute("SELECT * FROM products WHERE user_id=?", (user_id,)).fetchall()
+        # Обновленный запрос: считаем количество подтвержденных привязок
+        query = """
+            SELECT p.*, 
+                   (SELECT COUNT(*) FROM product_messages pm 
+                    WHERE pm.product_id = p.id AND pm.status = 'confirmed') as confirmed_count
+            FROM products p
+            WHERE p.user_id = ?
+        """
+        products = db.execute(query, (user_id,)).fetchall()
         return jsonify([dict(p) for p in products])
-    
+        
     # POST
     data = request.get_json()
-    folder_id = data.get('folder_id') # Получаем ID папки из запроса
+    folder_id = data.get('folder_id')
+
     
     # ДОБАВЛЕНО: сохранение folder_id в базу данных
     db.execute("INSERT INTO products (user_id, name, synonyms, price, folder_id) VALUES (?, ?, ?, ?, ?)",
@@ -5111,36 +5120,47 @@ qrBtn.addEventListener('click', async () => {
         });
 
         // ЗАГРУЗКА И ОТРИСОВКА ТОВАРОВ
-        async function loadProducts() {
-    const prods = await cachedApiFetch('/api/products');
-    const tbody = document.getElementById('products-tbody');
-    if (!tbody) return;
+     async function loadProducts() {
+            const prods = await cachedApiFetch('/api/products');
+            const tbody = document.getElementById('products-tbody');
+            if (!tbody) return;
 
-    // Фильтруем данные по выбранной папке
-    const filtered = currentProductFolderView === 'all' 
-        ? prods 
-        : prods.filter(p => p.folder_id == currentProductFolderView);
+            // Фильтруем данные по выбранной папке
+            const filtered = currentProductFolderView === 'all' 
+                ? prods 
+                : prods.filter(p => p.folder_id == currentProductFolderView);
 
-    tbody.innerHTML = filtered.map(p => {
-        const safeName = String(p.name || '').replace(/['"]/g, '`');
-        const safeSyns = String(p.synonyms || '').replace(/['"]/g, '`');
-        
-        return `
-            <tr style="cursor: pointer;" 
-                onclick="openProductBinding(${p.id}, '${safeName}')"
-                onmouseover="this.style.background='#3a3a3a'" 
-                onmouseout="this.style.background='transparent'">
+            tbody.innerHTML = filtered.map(p => {
+                const safeName = String(p.name || '').replace(/['"]/g, '`');
+                const safeSyns = String(p.synonyms || '').replace(/['"]/g, '`');
                 
-                <td><strong>${p.name}</strong></td>
-                <td style="color: #aaa;">${p.synonyms || ''}</td>
-                <td style="white-space: nowrap;">
-                    <button class="save-btn" onclick="event.stopPropagation(); editProduct(${p.id}, '${safeName}', '${safeSyns}')" style="background:#f39c12; margin-right:4px;">✏️</button>
-                    <button class="save-btn" onclick="event.stopPropagation(); openMoveFolderModal(${p.id}, '${safeName}', ${p.folder_id || 'null'})" style="background:#3498db; margin-right:4px;">📁</button>
-                    <button class="save-btn" onclick="event.stopPropagation(); deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
-                </td>
-            </tr>
-        `}).join('');
-}
+                // === НОВАЯ ЛОГИКА ПОДСВЕТКИ ===
+                // Проверяем, есть ли подтвержденные привязки (> 0)
+                const hasConfirmed = p.confirmed_count > 0;
+                
+                // Если нет подтверждений, задаем полупрозрачный красный фон, иначе - прозрачный
+                const defaultBg = hasConfirmed ? 'transparent' : 'rgba(231, 76, 60, 0.15)';
+                const hoverBg = hasConfirmed ? '#3a3a3a' : 'rgba(231, 76, 60, 0.3)';
+                const textHighlight = hasConfirmed ? '' : 'color: #ffb8b8;'; // Слегка подкрашиваем текст
+                const nameIndicator = hasConfirmed ? p.name : `⚠️ ${p.name}`; // Добавляем иконку-предупреждение
+                // ==============================
+
+                return `
+                    <tr style="cursor: pointer; background: ${defaultBg}; transition: background 0.2s;" 
+                        onclick="openProductBinding(${p.id}, '${safeName}')"
+                        onmouseover="this.style.background='${hoverBg}'" 
+                        onmouseout="this.style.background='${defaultBg}'">
+                        
+                        <td style="${textHighlight}"><strong>${nameIndicator}</strong></td>
+                        <td style="${hasConfirmed ? 'color: #aaa;' : 'color: #e74c3c;'}">${p.synonyms || 'нет'}</td>
+                        <td style="white-space: nowrap;">
+                            <button class="save-btn" onclick="event.stopPropagation(); editProduct(${p.id}, '${safeName}', '${safeSyns}')" style="background:#f39c12; margin-right:4px;">✏️</button>
+                            <button class="save-btn" onclick="event.stopPropagation(); openMoveFolderModal(${p.id}, '${safeName}', ${p.folder_id || 'null'})" style="background:#3498db; margin-right:4px;">📁</button>
+                            <button class="save-btn" onclick="event.stopPropagation(); deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
+                        </td>
+                    </tr>
+                `}).join('');
+        }
 
         // РЕДАКТИРОВАНИЕ ТОВАРА
         let currentEditProductId = null;
