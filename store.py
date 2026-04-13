@@ -4711,64 +4711,7 @@ async function loadProducts() {
         `}).join('');
 }
 
-    function buildItem(folder, parent) {
-        const li = document.createElement('li');
-        li.style.listStyle = 'none';
-        li.dataset.id = folder.id;
-        if (currentProductFolderView == folder.id) li.classList.add('active');
-
-        const hasChildren = folder.children && folder.children.length > 0;
-
-        const div = document.createElement('div');
-        div.style.display = 'flex';
-        div.style.alignItems = 'center';
-        div.style.padding = '3px 0';
-
-        // Создаем стрелочку-переключатель
-        const toggle = document.createElement('span');
-        toggle.className = 'folder-toggle';
-        toggle.innerHTML = hasChildren ? '▶' : ''; 
-        toggle.onclick = (e) => {
-            e.stopPropagation();
-            li.classList.toggle('expanded'); // Переключаем видимость детей
-        };
-
-        const nameSpan = document.createElement('span');
-        nameSpan.className = 'folder-name';
-        nameSpan.style.cursor = 'pointer';
-        nameSpan.style.padding = '4px 8px';
-        nameSpan.style.borderRadius = '4px';
-        nameSpan.style.flex = '1';
-        nameSpan.innerHTML = `📂 ${folder.name}`;
-        nameSpan.onclick = () => filterProductsByFolder(folder.id, folder.name);
-
-        div.appendChild(toggle);
-        div.appendChild(nameSpan);
-        li.appendChild(div);
-
-        if (hasChildren) {
-            const ul = document.createElement('ul');
-            folder.children.forEach(child => buildItem(child, ul));
-            li.appendChild(ul);
-            
-            // Если внутри этой папки находится текущий выбранный товар, раскрываем её сразу
-            if (isChildSelected(folder)) {
-                li.classList.add('expanded');
-            }
-        }
-        parent.appendChild(li);
-    }
-
-    // Вспомогательная функция, чтобы дерево было раскрыто до активной папки при загрузке
-    function isChildSelected(folder) {
-        if (!folder.children) return false;
-        return folder.children.some(c => c.id == currentProductFolderView || isChildSelected(c));
-    }
-
-    folders.forEach(f => {
-        if (f.name !== 'По умолчанию') buildItem(f, container);
-    });
-
+    
 
 function filterProductsByFolder(folderId, folderName) {
     currentProductFolderView = folderId;
@@ -4937,10 +4880,83 @@ function filterProductsByFolder(folderId, folderName) {
         if (typeof loadUsers === 'function') loadUsers();
     }
 }
-
+async function loadProductsFolderTree() {
+    const folders = await cachedApiFetch('/api/folders/tree');
+    renderProductFoldersTree(folders);
+}
             // Боковую панель с папками показываем только в Парсере
          
-        
+  // --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОТРИСОВКИ ДЕРЕВА ---
+// --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОТРИСОВКИ ДЕРЕВА КАТЕГОРИЙ ---
+function renderProductFoldersTree(folders) {
+    const container = document.getElementById('products-folder-tree');
+    if (!container) return;
+    
+    // Очищаем и добавляем корневой элемент
+    container.innerHTML = `<li data-id="all" class="active"><div style="padding: 4px 8px; cursor:pointer;" onclick="filterProductsByFolder('all', 'Все товары')">📂 Все товары</div></li>`;
+
+    function buildItem(folder, parent) {
+        const li = document.createElement('li');
+        li.style.listStyle = 'none';
+        li.dataset.id = folder.id;
+        if (currentProductFolderView == folder.id) li.classList.add('active');
+
+        const hasChildren = folder.children && folder.children.length > 0;
+
+        const div = document.createElement('div');
+        div.style.display = 'flex';
+        div.style.alignItems = 'center';
+        div.style.padding = '3px 0';
+
+        // Создаем стрелочку-переключатель
+        const toggle = document.createElement('span');
+        toggle.className = 'folder-toggle';
+        toggle.innerHTML = hasChildren ? '▶' : ''; 
+        toggle.onclick = (e) => {
+            e.stopPropagation();
+            li.classList.toggle('expanded'); // Переключаем видимость детей
+        };
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'folder-name';
+        nameSpan.style.cursor = 'pointer';
+        nameSpan.style.padding = '4px 8px';
+        nameSpan.style.borderRadius = '4px';
+        nameSpan.style.flex = '1';
+        nameSpan.innerHTML = `📂 ${folder.name}`;
+        nameSpan.onclick = () => filterProductsByFolder(folder.id, folder.name);
+
+        div.appendChild(toggle);
+        div.appendChild(nameSpan);
+        li.appendChild(div);
+
+        if (hasChildren) {
+            const ul = document.createElement('ul');
+            folder.children.forEach(child => buildItem(child, ul));
+            li.appendChild(ul);
+            
+            // Если внутри этой папки находится текущий выбранный товар, раскрываем её сразу
+            if (isChildSelected(folder)) {
+                li.classList.add('expanded');
+            }
+        }
+        parent.appendChild(li);
+    }
+
+    // Вспомогательная функция для проверки вложенности
+    function isChildSelected(folder) {
+        if (!folder.children) return false;
+        return folder.children.some(c => c.id == currentProductFolderView || isChildSelected(c));
+    }
+
+    // Запускаем цикл отрисовки по полученным данным
+    folders.forEach(f => {
+        if (f.name !== 'По умолчанию') buildItem(f, container);
+    });
+} // <--- Эта скобка теперь закрывает renderProductFoldersTree
+
+// --- ТАКЖЕ ДОБАВЬТЕ ЭТУ ФУНКЦИЮ, ЕСЛИ ЕЕ НЕТ ---
+
 
         menuItems.forEach(item => {
             item.addEventListener('click', () => {
