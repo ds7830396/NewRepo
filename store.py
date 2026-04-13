@@ -164,8 +164,12 @@ def bot_interaction_scheduler():
                             bot_username = interaction['bot_username']
                             
                             # Отправляем команды по очереди
+                            # Отправляем команды по очереди
                             for cmd in commands:
-                                asyncio.run_coroutine_threadsafe(client.send_message(bot_username, cmd), loop)
+                                try:
+                                    asyncio.run_coroutine_threadsafe(client.send_message(bot_username, cmd), loop)
+                                except Exception as e:
+                                    logger.error(f"Не удалось отправить команду боту (сессия закрыта): {e}")
                                 time.sleep(2) # Небольшая пауза между командами
                             
                             # Обновляем время последнего запуска
@@ -497,10 +501,10 @@ def manage_products():
     user_id = session['user_id']
     db = get_db()
     if request.method == 'GET':
-        # Обновленный запрос: считаем количество подтвержденных привязок
         query = """
             SELECT p.*, 
                    (SELECT COUNT(*) FROM product_messages pm 
+                    JOIN messages m ON pm.message_id = m.id 
                     WHERE pm.product_id = p.id AND pm.status = 'confirmed') as confirmed_count
             FROM products p
             WHERE p.user_id = ?
@@ -509,13 +513,34 @@ def manage_products():
         return jsonify([dict(p) for p in products])
         
     # POST
+    # POST
     data = request.get_json()
     folder_id = data.get('folder_id')
-
     
-    # ДОБАВЛЕНО: сохранение folder_id в базу данных
-    db.execute("INSERT INTO products (user_id, name, synonyms, price, folder_id) VALUES (?, ?, ?, ?, ?)",
-               (user_id, data.get('name'), data.get('synonyms', ''), data.get('price', 0.0), folder_id))
+    # Обработка синонимов (теперь с фронтенда может приходить список)
+    syns = data.get('synonyms')
+    if isinstance(syns, list):
+        synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
+    else:
+        synonyms_str = syns or ''
+
+    db.execute("""
+        INSERT INTO products 
+        (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id, 
+        data.get('name'), 
+        synonyms_str, 
+        data.get('price', 0.0), 
+        folder_id,
+        data.get('photo_url'),
+        data.get('brand'),
+        data.get('country'),
+        data.get('weight'),
+        data.get('model_number'),
+        1 if data.get('is_on_request') else 0
+    ))
     db.commit()
     notify_clients()
      
@@ -1045,15 +1070,64 @@ def link_product_folder(prod_id):
     notify_clients()
     return jsonify({'success': True})
 
-
-
 @app.route('/api/products/<int:prod_id>', methods=['PUT'])
 @login_required
-def edit_product(prod_id):
+def update_product(prod_id):
     data = request.get_json()
+    user_id = session['user_id']
     db = get_db()
-    db.execute("UPDATE products SET name=?, synonyms=? WHERE id=? AND user_id=?", 
-               (data['name'], data['synonyms'], prod_id, session['user_id']))
+    
+    syns = data.get('synonyms', [])
+    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
+        
+    db.execute("""
+        UPDATE products 
+        SET name=?, synonyms=?, photo_url=?, brand=?, country=?, weight=?, model_number=?, is_on_request=?
+        WHERE id=? AND user_id=?
+    """, (
+        data.get('name'), 
+        synonyms_str, 
+        data.get('photo_url'),
+        data.get('brand'),
+        data.get('country'),
+        data.get('weight'),
+        data.get('model_number'),
+        1 if data.get('is_on_request') else 0,
+        prod_id, 
+        user_id
+    ))
+    db.commit()
+    notify_clients()
+    return jsonify({'success': True})
+
+@app.route('/api/products', methods=['POST'])
+@login_required
+def add_product():
+    data = request.get_json()
+    user_id = session['user_id']
+    db = get_db()
+
+    # Превращаем массив синонимов в строку для БД
+    syns = data.get('synonyms', [])
+    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
+
+    db.execute("""
+        INSERT INTO products 
+        (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id, 
+        data.get('name'), 
+        synonyms_str, 
+        data.get('price', 0), 
+        data.get('folder_id'),
+        data.get('photo_url'),
+        data.get('brand'),
+        data.get('country'),
+        data.get('weight'),
+        data.get('model_number'),
+        1 if data.get('is_on_request') else 0
+    ))
     db.commit()
     notify_clients()
     return jsonify({'success': True})
@@ -1453,8 +1527,11 @@ def publish_scheduler():
                             except Exception as e:
                                 logger.error(f"Ошибка отправки разделенного сообщения: {e}")
                                 
-                    asyncio.run_coroutine_threadsafe(update_or_create(chat_id, message_id, message_text, pub_id), loop)
-                    last_publish_times[pub_id] = now
+                    try:
+                        asyncio.run_coroutine_threadsafe(update_or_create(chat_id, message_id, message_text, pub_id), loop)
+                        last_publish_times[pub_id] = now
+                    except Exception as e:
+                        logger.error(f"Ошибка передачи в цикл публикации: {e}")
 
             except Exception as e:
                 logging.error(f"Ошибка в планировщике публикации: {e}")
@@ -2096,6 +2173,7 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
             loop = asyncio.new_event_loop()
          
             asyncio.set_event_loop(loop)
+            loop.set_exception_handler(custom_exception_handler)
             session_file = f'sessions/user_{user_id}_{session_id}'
             client = TelegramClient(session_file, int(api_id), api_hash)
             
@@ -2374,6 +2452,7 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                                             break
                                 
                                 # Если товар все еще есть в новом прайсе — переносим привязку
+                                # Если товар все еще есть в новом прайсе — переносим привязку
                                 if match_found:
                                     db.execute("""
                                         UPDATE product_messages 
@@ -2381,18 +2460,24 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                                         WHERE id = ?
                                     """, (new_msg_id, line_idx, new_price, b['id']))
                         
-                        # Б. Безопасное удаление старых сообщений (разгружаем базу)
-                        # Оставляем зазор в 5 минут, чтобы не сломать прайсы, которые бот отправляет несколькими сообщениями подряд
-                        # Зазор 0 минут: как только пришел новый прайс, старый удаляется МГНОВЕННО
-                        
+                        # Б. Умная очистка старых сообщений и неактуальных товаров
                         cutoff_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        # 1. Помечаем товары как неактуальные, если они "застряли" на старом сообщении
+                        db.execute("""
+                            UPDATE product_messages 
+                            SET is_actual = 0 
+                            WHERE message_id IN (
+                                SELECT id FROM messages 
+                                WHERE chat_id = ? AND user_id = ? AND id != ? AND date < ?
+                            )
+                        """, (chat_id, user_id, new_msg_id, cutoff_time))
+                        
+                        # 2. Безопасно удаляем старые сообщения
                         db.execute("""
                             DELETE FROM messages 
-                            WHERE chat_id = ? 
-                              AND user_id = ? 
-                              AND id != ? 
-                              AND date < ?
-                              AND id NOT IN (SELECT message_id FROM product_messages)
+                            WHERE chat_id = ? AND user_id = ? AND id != ? AND date < ?
+                              AND id NOT IN (SELECT message_id FROM product_messages WHERE is_actual = 1)
                         """, (chat_id, user_id, new_msg_id, cutoff_time))
                         
                         db.commit()
@@ -2502,6 +2587,18 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                     loop.close()
                 except Exception:
                     pass
+                
+                # 4. === ЗАЩИТА СТАТУСА: Сбрасываем статус на "выключен", если поток упал ===
+                try:
+                    with app.app_context():
+                        local_db = get_db()
+                        local_db.execute("UPDATE user_telegram_sessions SET status = 'inactive' WHERE id = ?", (session_id,))
+                        local_db.commit()
+                        if 'notify_clients' in globals(): 
+                            notify_clients()
+                except Exception as e:
+                    logging.error(f"Не удалось сбросить статус сессии {session_id} в БД: {e}")
+                # ===========================================================================
 
                 logging.info(f"Сессия {session_id}: слушатель полностью остановлен")
 
@@ -3934,25 +4031,15 @@ TEMPLATE = """
             
             <input type="text" id="product-search" placeholder="Поиск по названию или синонимам..." style="width:100%; padding:10px; margin-bottom: 16px; background:#1e1e1e; border:1px solid #3a3a3a; color:#fff; border-radius:4px;">
             
-            <div class="card" style="background:#1e1e1e; padding:16px; border-radius:8px; margin-bottom:16px; border: 1px solid #333;">
-                <form id="add-product-form" style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end;">
-                    <div class="form-group">
-                        <label style="font-size: 12px; color: #aaa;">Название товара</label>
-                        <input type="text" id="prod_name" required style="padding: 8px; background: #2a2a2a; border: 1px solid #3a3a3a; color: #fff; border-radius: 4px;">
-                    </div>
-                    <div class="form-group">
-                        <label style="font-size: 12px; color: #aaa;">Синонимы (через запятую)</label>
-                        <input type="text" id="prod_synonyms" placeholder="айфон, iPhone" style="padding: 8px; background: #2a2a2a; border: 1px solid #3a3a3a; color: #fff; border-radius: 4px;">
-                    </div>
-                    <div class="form-group">
-                        <label style="font-size: 12px; color: #aaa;">Папка (Каталог)</label>
-                        <select id="prod_folder_id" style="padding:8px; background:#2a2a2a; border:1px solid #3a3a3a; color:#fff; border-radius:4px;">
-                            <option value="">Без папки (Общие)</option>
-                        </select>
-                    </div>
-                    <button type="submit" class="save-btn" style="height: 36px;">Добавить</button>
-                </form>
-            </div>
+            <div class="card" style="background:#1e1e1e; padding:16px; border-radius:8px; margin-bottom:16px; border: 1px solid #333; display: flex; justify-content: space-between; align-items: center;">
+    <div>
+        <h3 style="margin: 0; color: #fff; font-size: 18px;">Управление товарами</h3>
+        <p style="margin: 5px 0 0 0; color: #aaa; font-size: 13px;">Нажмите кнопку справа, чтобы добавить новый товар в каталог</p>
+    </div>
+    <button type="button" class="save-btn" style="background:#27ae60; font-size:15px; padding:10px 24px; font-weight:bold; border-radius: 6px; border: none; color: white; cursor: pointer; box-shadow: 0 4px 15px rgba(39, 174, 96, 0.3); transition: background 0.2s;" onclick="openAddModal()" onmouseover="this.style.background='#2ecc71'" onmouseout="this.style.background='#27ae60'">
+        ➕ Добавить товар
+    </button>
+</div>
 
             <table class="messages-table">
                 <thead><tr><th>Название</th><th>Синонимы</th><th>Действия</th></tr></thead>
@@ -3983,32 +4070,43 @@ TEMPLATE = """
     </div>
 </div>
 
-<div id="edit-modal" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); background:#2a2a2a; padding:20px; border-radius:8px; z-index:1000; border:1px solid #f39c12; width: 400px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
-<div id="move-folder-modal" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); background:#2a2a2a; padding:20px; border-radius:8px; z-index:1000; border:1px solid #3498db; width: 400px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
-    <h3 style="margin-bottom:15px; color:#fff;">Настроить папку: <br><span id="move-prod-name" style="color:#3498db; font-size: 16px;"></span></h3>
-    <div class="form-group" style="margin-bottom:15px;">
-        <label style="color:#aaa;">Выберите новую папку</label>
-        <select id="move-folder-select" style="width:100%; padding:8px; background:#1e1e1e; border:1px solid #3a3a3a; color:#fff; border-radius:4px;">
-        </select>
+<div id="product-modal" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); background:#222; color:#fff; padding:30px; border-radius:15px; width:450px; z-index:2000; box-shadow:0 20px 60px rgba(0,0,0,0.7); border:1px solid #444;">
+    <h2 id="modal-title" style="margin-top:0;">Добавить товар</h2>
+    
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+        <div style="grid-column: span 2;">
+            <label>Название</label>
+            <input type="text" id="p-name" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+        </div>
+        <div>
+            <label>Бренд</label>
+            <input type="text" id="p-brand" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+        </div>
+        <div>
+            <label>Модель</label>
+            <input type="text" id="p-model" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+        </div>
     </div>
-    <div style="display:flex; gap:10px;">
-        <button onclick="saveProductFolder()" style="flex:1; padding:10px; background:#3498db; color:#fff; border:none; cursor:pointer; border-radius:4px; font-weight:bold;">💾 Сохранить</button>
-        <button onclick="document.getElementById('move-folder-modal').style.display='none'" style="flex:1; padding:10px; background:#4a4a4a; color:#fff; border:none; cursor:pointer; border-radius:4px;">❌ Отмена</button>
-    </div>
-</div>
 
-<h3 style="margin-bottom:15px; color:#fff;">Редактировать товар</h3>
-    <div class="form-group" style="margin-bottom:10px;">
-        <label style="color:#aaa;">Название</label>
-        <input type="text" id="edit-prod-name" style="width:100%; padding:8px; background:#1e1e1e; border:1px solid #3a3a3a; color:#fff; border-radius:4px;">
+    <div style="margin-top:15px;">
+        <label>Ссылка на фото</label>
+        <input type="text" id="p-photo" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
     </div>
-    <div class="form-group" style="margin-bottom:15px;">
-        <label style="color:#aaa;">Синонимы (через запятую)</label>
-        <input type="text" id="edit-prod-synonyms" style="width:100%; padding:8px; background:#1e1e1e; border:1px solid #3a3a3a; color:#fff; border-radius:4px;">
+
+    <div style="margin-top:20px; border-top:1px solid #444; padding-top:15px;">
+        <label style="color:#4a90e2; font-size:12px; font-weight:bold;">СИНОНИМЫ (Ключевые слова)</label>
+        <div id="synonyms-list" style="max-height:150px; overflow-y:auto; margin-bottom:10px;">
+            </div>
+        <button type="button" onclick="addSynonymField()" style="width:100%; padding:5px; background:none; border:1px dashed #4a90e2; color:#4a90e2; cursor:pointer;">+ Добавить синоним</button>
     </div>
-    <div style="display:flex; gap:10px;">
-        <button onclick="saveEditProduct()" style="flex:1; padding:10px; background:#27ae60; color:#fff; border:none; cursor:pointer; border-radius:4px; font-weight:bold;">💾 Сохранить</button>
-        <button onclick="document.getElementById('edit-modal').style.display='none'" style="flex:1; padding:10px; background:#4a4a4a; color:#fff; border:none; cursor:pointer; border-radius:4px;">❌ Отмена</button>
+
+    <div style="margin-top:15px;">
+        <label><input type="checkbox" id="p-request"> Цена по запросу</label>
+    </div>
+
+    <div style="margin-top:25px; display:flex; gap:10px;">
+        <button onclick="saveProductAction()" style="flex:1; padding:10px; background:#27ae60; border:none; color:white; font-weight:bold; cursor:pointer;">СОХРАНИТЬ</button>
+        <button onclick="closeProductModal()" style="padding:10px; background:#c0392b; border:none; color:white; cursor:pointer;">ОТМЕНА</button>
     </div>
 </div>
 
@@ -5134,46 +5232,48 @@ qrBtn.addEventListener('click', async () => {
 
         // ЗАГРУЗКА И ОТРИСОВКА ТОВАРОВ
      async function loadProducts() {
-            const prods = await cachedApiFetch('/api/products');
-            const tbody = document.getElementById('products-tbody');
-            if (!tbody) return;
+    // Добавили true, чтобы принудительно обновить кэш и сбросить призраков
+    const prods = await cachedApiFetch('/api/products', true); 
+    const tbody = document.getElementById('products-tbody');
+    if (!tbody) return;
 
-            // Фильтруем данные по выбранной папке
-            const filtered = currentProductFolderView === 'all' 
-                ? prods 
-                : prods.filter(p => p.folder_id == currentProductFolderView);
+    // Фильтруем данные по выбранной папке
+    const filtered = currentProductFolderView === 'all' 
+        ? prods 
+        : prods.filter(p => p.folder_id == currentProductFolderView);
 
-            tbody.innerHTML = filtered.map(p => {
-                const safeName = String(p.name || '').replace(/['"]/g, '`');
-                const safeSyns = String(p.synonyms || '').replace(/['"]/g, '`');
+    tbody.innerHTML = filtered.map(p => {
+        const safeName = String(p.name || '').replace(/['"]/g, '`');
+        const safeSyns = String(p.synonyms || '').replace(/['"]/g, '`');
+
+        // Проверяем, есть ли РЕАЛЬНЫЕ подтвержденные привязки
+        const hasConfirmed = p.confirmed_count > 0;
+
+        // ЦВЕТА СТРОКИ: Если нет подтверждений - ЯРКО КРАСНЫЙ
+        const rowBg = hasConfirmed ? 'transparent' : 'rgba(231, 76, 60, 0.2)';
+        const rowHover = hasConfirmed ? '#3a3a3a' : 'rgba(231, 76, 60, 0.4)';
+        const textColor = hasConfirmed ? '#ffffff' : '#ff4d4d'; // Ярко-красный текст для всего
+
+        const nameIndicator = hasConfirmed ? p.name : `⚠️ ${p.name}`;
+
+        return `
+            <tr style="cursor: pointer; background: ${rowBg}; color: ${textColor}; transition: background 0.2s;" 
+                onclick="openProductBinding(${p.id}, '${safeName}')"
+                onmouseover="this.style.background='${rowHover}'" 
+                onmouseout="this.style.background='${rowBg}'">
                 
-                // === НОВАЯ ЛОГИКА ПОДСВЕТКИ ===
-                // Проверяем, есть ли подтвержденные привязки (> 0)
-                const hasConfirmed = p.confirmed_count > 0;
+                <td><strong>${nameIndicator}</strong></td>
                 
-                // Если нет подтверждений, задаем полупрозрачный красный фон, иначе - прозрачный
-                const defaultBg = hasConfirmed ? 'transparent' : 'rgba(231, 76, 60, 0.15)';
-                const hoverBg = hasConfirmed ? '#3a3a3a' : 'rgba(231, 76, 60, 0.3)';
-                const textHighlight = hasConfirmed ? '' : 'color: #ffb8b8;'; // Слегка подкрашиваем текст
-                const nameIndicator = hasConfirmed ? p.name : `⚠️ ${p.name}`; // Добавляем иконку-предупреждение
-                // ==============================
-
-                return `
-                    <tr style="cursor: pointer; background: ${defaultBg}; transition: background 0.2s;" 
-                        onclick="openProductBinding(${p.id}, '${safeName}')"
-                        onmouseover="this.style.background='${hoverBg}'" 
-                        onmouseout="this.style.background='${defaultBg}'">
-                        
-                        <td style="${textHighlight}"><strong>${nameIndicator}</strong></td>
-                        <td style="${hasConfirmed ? 'color: #aaa;' : 'color: #e74c3c;'}">${p.synonyms || 'нет'}</td>
-                        <td style="white-space: nowrap;">
-                            <button class="save-btn" onclick="event.stopPropagation(); editProduct(${p.id}, '${safeName}', '${safeSyns}')" style="background:#f39c12; margin-right:4px;">✏️</button>
-                            <button class="save-btn" onclick="event.stopPropagation(); openMoveFolderModal(${p.id}, '${safeName}', ${p.folder_id || 'null'})" style="background:#3498db; margin-right:4px;">📁</button>
-                            <button class="save-btn" onclick="event.stopPropagation(); deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
-                        </td>
-                    </tr>
-                `}).join('');
-        }
+                <td style="color: ${hasConfirmed ? '#aaa' : '#ff4d4d'};">${p.synonyms || 'нет'}</td>
+                
+                <td style="white-space: nowrap;">
+                    <button class="save-btn" onclick="event.stopPropagation(); editProduct(${p.id}, '${safeName}', '${safeSyns}')" style="background:#f39c12; margin-right:4px;">✏️</button>
+                    <button class="save-btn" onclick="event.stopPropagation(); openMoveFolderModal(${p.id}, '${safeName}', ${p.folder_id || 'null'})" style="background:#3498db; margin-right:4px;">📁</button>
+                    <button class="save-btn" onclick="event.stopPropagation(); deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
+                </td>
+            </tr>
+        `}).join('');
+}
 
         // РЕДАКТИРОВАНИЕ ТОВАРА
         let currentEditProductId = null;
@@ -7006,10 +7106,8 @@ socket.on('db_updated', function(data) {
         if (typeof currentView !== 'undefined') { 
             if (document.getElementById('parser-section').style.display === 'block') { 
                 // --- ИСПРАВЛЕНО: Передаем currentPage, чтобы оставаться на текущей странице ---
-                if (currentView === 'inbox' && typeof loadMessages === 'function') {
+                if ((currentView === 'inbox' || currentView.startsWith('folder_')) && typeof loadMessages === 'function') {
                     loadMessages(typeof currentPage !== 'undefined' ? currentPage : 1);
-                } else if (typeof loadFolderMessages === 'function') {
-                    loadFolderMessages(currentView);
                 }
             } 
         }
@@ -8665,6 +8763,109 @@ async function loadPubMarkups(pubId) {
     `).join('');
 }
 
+
+let currentEditingId = null;
+
+// 1. ФУНКЦИЯ ЗАКРЫТИЯ ОКНА (Кнопка ОТМЕНА)
+function closeProductModal() {
+    document.getElementById('product-modal').style.display = 'none';
+}
+
+// 2. ФУНКЦИЯ ОЧИСТКИ ФОРМЫ
+function resetForm() {
+    document.getElementById('p-name').value = '';
+    document.getElementById('p-brand').value = '';
+    document.getElementById('p-model').value = '';
+    document.getElementById('p-photo').value = '';
+    document.getElementById('p-request').checked = false;
+    document.getElementById('synonyms-list').innerHTML = '';
+    addSynonymField(); // Добавляем одну пустую строку по умолчанию
+}
+
+// 3. ДОБАВЛЕНИЕ СТРОКИ СИНОНИМА
+function addSynonymField(value = "") {
+    const container = document.getElementById('synonyms-list');
+    const row = document.createElement('div');
+    row.style = "display:flex; gap:5px; margin-bottom:5px;";
+    row.innerHTML = `
+        <input type="text" class="synonym-input" value="${value}" style="flex:1; padding:5px; background:#111; border:1px solid #444; color:#eee;">
+        <button type="button" onclick="this.parentElement.remove()" style="background:none; border:none; color:#e74c3c; cursor:pointer; font-size:18px;">&times;</button>
+    `;
+    container.appendChild(row);
+}
+
+// 4. ОТКРЫТИЕ ОКНА ДЛЯ НОВОГО ТОВАРА (Кнопка "Добавить товар")
+function openAddModal() {
+    currentEditingId = null;
+    document.getElementById('modal-title').innerText = "Добавить товар";
+    resetForm(); // Теперь форма не будет выдавать ошибку
+    document.getElementById('product-modal').style.display = 'block';
+}
+
+// 5. ОТКРЫТИЕ ОКНА ДЛЯ РЕДАКТИРОВАНИЯ (Кнопка "✏️")
+function openEditModal(prod) {
+    currentEditingId = prod.id;
+    document.getElementById('modal-title').innerText = "Редактировать товар";
+    
+    document.getElementById('p-name').value = prod.name || "";
+    document.getElementById('p-brand').value = prod.brand || "";
+    document.getElementById('p-model').value = prod.model_number || "";
+    document.getElementById('p-photo').value = prod.photo_url || "";
+    document.getElementById('p-request').checked = prod.is_on_request === 1;
+    
+    const container = document.getElementById('synonyms-list');
+    container.innerHTML = "";
+    if (prod.synonyms) {
+        prod.synonyms.split(',').forEach(s => addSynonymField(s.trim()));
+    } else {
+        addSynonymField(); // Пустое поле если синонимов нет
+    }
+    
+    document.getElementById('product-modal').style.display = 'block';
+}
+
+// 6. ОТПРАВКА ДАННЫХ (Кнопка "СОХРАНИТЬ")
+async function saveProductAction() {
+    const synInputs = document.querySelectorAll('.synonym-input');
+    const synonymsArr = Array.from(synInputs).map(i => i.value.trim()).filter(v => v !== "");
+    
+    // Собираем данные
+    const payload = {
+        name: document.getElementById('p-name').value,
+        brand: document.getElementById('p-brand').value,
+        model_number: document.getElementById('p-model').value,
+        photo_url: document.getElementById('p-photo').value,
+        is_on_request: document.getElementById('p-request').checked ? 1 : 0,
+        synonyms: synonymsArr
+    };
+
+    const url = currentEditingId ? `/api/products/${currentEditingId}` : '/api/products';
+    const method = currentEditingId ? 'PUT' : 'POST';
+
+    try {
+        const response = await fetch(url, {
+            method: method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (response.ok) {
+            closeProductModal(); // Закрываем окно при успехе
+            
+            // Обновляем таблицу товаров
+            if (typeof loadProducts === 'function') {
+                loadProducts();
+            } else {
+                location.reload(); 
+            }
+        } else {
+            alert("Ошибка при сохранении. Проверьте консоль.");
+        }
+    } catch (error) {
+        console.error("Ошибка запроса:", error);
+        alert("Не удалось связаться с сервером.");
+    }
+}
 async function savePubMarkup() {
     const pubId = document.getElementById('pub_id').value;
 
@@ -9644,13 +9845,23 @@ def delayed_messages_scheduler():
                                         """, (msg_id, line_idx, new_price, b['id']))
                             
                             # Очистка старых сообщений (зазор 5 минут)
-                            
-                            # Зазор 0 минут: как только пришел новый прайс, старый удаляется МГНОВЕННО
                             cutoff_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            # 1. Помечаем товары как неактуальные
+                            db.execute("""
+                                UPDATE product_messages 
+                                SET is_actual = 0 
+                                WHERE message_id IN (
+                                    SELECT id FROM messages 
+                                    WHERE chat_id = ? AND user_id = ? AND id != ? AND date < ?
+                                )
+                            """, (chat_id, user_id, msg_id, cutoff_time))
+                            
+                            # 2. Удаляем старые сообщения
                             db.execute("""
                                 DELETE FROM messages 
                                 WHERE chat_id = ? AND user_id = ? AND id != ? AND date < ?
-                                  AND id NOT IN (SELECT message_id FROM product_messages)
+                                  AND id NOT IN (SELECT message_id FROM product_messages WHERE is_actual = 1)
                             """, (chat_id, user_id, msg_id, cutoff_time))
 
                             db.commit()
