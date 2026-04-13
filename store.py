@@ -514,15 +514,13 @@ def manage_products():
         
     # POST
     # POST
+    # POST
     data = request.get_json()
     folder_id = data.get('folder_id')
     
-    # Обработка синонимов (теперь с фронтенда может приходить список)
-    syns = data.get('synonyms')
-    if isinstance(syns, list):
-        synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
-    else:
-        synonyms_str = syns or ''
+    # Обработка синонимов (из массива в строку)
+    syns = data.get('synonyms', [])
+    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()]) if isinstance(syns, list) else (syns or '')
 
     db.execute("""
         INSERT INTO products 
@@ -543,7 +541,6 @@ def manage_products():
     ))
     db.commit()
     notify_clients()
-     
     return jsonify({'success': True})
 
 @app.route('/api/products/<int:prod_id>', methods=['DELETE'])
@@ -861,6 +858,15 @@ def init_db():
         # Добавляем новые колонки в существующие таблицы (игнорируем ошибку, если они уже есть)
         # 1. Безопасное добавление колонок
         columns_to_add = [
+            ("products", "photo_url TEXT DEFAULT NULL"),
+            ("products", "brand TEXT DEFAULT NULL"),
+            ("products", "country TEXT DEFAULT NULL"),
+            ("products", "weight TEXT DEFAULT NULL"),
+            ("products", "model_number TEXT DEFAULT NULL"),
+            ("products", "is_on_request INTEGER DEFAULT 0"),
+            
+            ("product_messages", "line_index INTEGER DEFAULT -1"),
+            ("product_messages", "group_id INTEGER"),
             ("product_messages", "line_index INTEGER DEFAULT -1"),
             ("product_messages", "group_id INTEGER"),
             ("product_messages", "is_actual INTEGER DEFAULT 1"), 
@@ -1072,13 +1078,12 @@ def link_product_folder(prod_id):
 
 @app.route('/api/products/<int:prod_id>', methods=['PUT'])
 @login_required
-def update_product(prod_id):
+def edit_product(prod_id):
     data = request.get_json()
-    user_id = session['user_id']
     db = get_db()
     
     syns = data.get('synonyms', [])
-    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
+    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()]) if isinstance(syns, list) else (syns or '')
         
     db.execute("""
         UPDATE products 
@@ -1094,7 +1099,7 @@ def update_product(prod_id):
         data.get('model_number'),
         1 if data.get('is_on_request') else 0,
         prod_id, 
-        user_id
+        session['user_id']
     ))
     db.commit()
     notify_clients()
@@ -2274,16 +2279,12 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                         new_price = None
                         
                         # Если привязка идет ко всему сообщению (line_index = -1)
+                        # Если привязка идет ко всему сообщению (line_index = -1)
                         if line_idx == -1:
                             text_lower = parsed_text.lower()
-                            # Проверяем, остался ли товар в этой строке
                             if any(syn in text_lower for syn in synonyms):
                                 is_actual = 1
-                                new_price = extract_price(edited_line)
-                                if not new_price and line_idx + 1 < len(lines):
-                                    new_price = extract_price(lines[line_idx+1])
-                                if not new_price and line_idx + 2 < len(lines):
-                                    new_price = extract_price(lines[line_idx+2])
+                                new_price = extract_price(parsed_text)
                                 
                         # Если привязка идет к конкретной строке
                         else:
@@ -5197,7 +5198,7 @@ qrBtn.addEventListener('click', async () => {
         document.querySelector('[data-section="reports"]')?.addEventListener('click', loadAllConfirmedReports);
 
         // Обновляем таблицу при клике на вкладку "Отчёты по товарам"
-        document.querySelector('[data-section="reports"]')?.addEventListener('click', loadAllConfirmedReports);
+       
 
 
 // --- Логика Товаров ---
@@ -5231,48 +5232,36 @@ qrBtn.addEventListener('click', async () => {
         });
 
         // ЗАГРУЗКА И ОТРИСОВКА ТОВАРОВ
-     async function loadProducts() {
-    // Добавили true, чтобы принудительно обновить кэш и сбросить призраков
+    async function loadProducts() {
     const prods = await cachedApiFetch('/api/products', true); 
     const tbody = document.getElementById('products-tbody');
     if (!tbody) return;
 
-    // Фильтруем данные по выбранной папке
     const filtered = currentProductFolderView === 'all' 
         ? prods 
         : prods.filter(p => p.folder_id == currentProductFolderView);
 
     tbody.innerHTML = filtered.map(p => {
-        const safeName = String(p.name || '').replace(/['"]/g, '`');
-        const safeSyns = String(p.synonyms || '').replace(/['"]/g, '`');
-
-        // Проверяем, есть ли РЕАЛЬНЫЕ подтвержденные привязки
+        const safe = (field) => String(field || '').replace(/['"]/g, '`');
         const hasConfirmed = p.confirmed_count > 0;
-
-        // ЦВЕТА СТРОКИ: Если нет подтверждений - ЯРКО КРАСНЫЙ
-        const rowBg = hasConfirmed ? 'transparent' : 'rgba(231, 76, 60, 0.2)';
-        const rowHover = hasConfirmed ? '#3a3a3a' : 'rgba(231, 76, 60, 0.4)';
-        const textColor = hasConfirmed ? '#ffffff' : '#ff4d4d'; // Ярко-красный текст для всего
-
-        const nameIndicator = hasConfirmed ? p.name : `⚠️ ${p.name}`;
+        const color = hasConfirmed ? '#ffffff' : '#ff4d4d';
 
         return `
-            <tr style="cursor: pointer; background: ${rowBg}; color: ${textColor}; transition: background 0.2s;" 
-                onclick="openProductBinding(${p.id}, '${safeName}')"
-                onmouseover="this.style.background='${rowHover}'" 
-                onmouseout="this.style.background='${rowBg}'">
-                
-                <td><strong>${nameIndicator}</strong></td>
-                
-                <td style="color: ${hasConfirmed ? '#aaa' : '#ff4d4d'};">${p.synonyms || 'нет'}</td>
-                
-                <td style="white-space: nowrap;">
-                    <button class="save-btn" onclick="event.stopPropagation(); editProduct(${p.id}, '${safeName}', '${safeSyns}')" style="background:#f39c12; margin-right:4px;">✏️</button>
-                    <button class="save-btn" onclick="event.stopPropagation(); openMoveFolderModal(${p.id}, '${safeName}', ${p.folder_id || 'null'})" style="background:#3498db; margin-right:4px;">📁</button>
-                    <button class="save-btn" onclick="event.stopPropagation(); deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
+            <tr style="cursor: pointer; color: ${color};" onclick="openProductBinding(${p.id}, '${safe(p.name)}')">
+                <td><strong>${hasConfirmed ? '' : '⚠️ '}${p.name}</strong></td>
+                <td>${p.brand || '—'}</td>
+                <td>${p.model_number || '—'}</td>
+                <td>${p.country || '—'}</td>
+                <td>${p.weight || '—'}</td>
+                <td>${p.photo_url ? '🖼️' : '—'}</td>
+                <td style="color: #aaa;">${p.synonyms || 'нет'}</td>
+                <td onclick="event.stopPropagation();">
+                    <button class="save-btn" onclick="openEditModal(${JSON.stringify(p).replace(/"/g, '&quot;')})" style="background:#f39c12;">✏️</button>
+                    <button class="save-btn" onclick="deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
                 </td>
             </tr>
-        `}).join('');
+        `;
+    }).join('');
 }
 
         // РЕДАКТИРОВАНИЕ ТОВАРА
@@ -9875,7 +9864,7 @@ def delayed_messages_scheduler():
         time.sleep(60) # Проверяем тайминги каждую минуту
 
 # ---------- Запуск приложения ----------
-update_database()
+
 if __name__ == '__main__':
     update_database()
     threading.Thread(target=publish_scheduler, daemon=True).start()
