@@ -129,7 +129,8 @@ def bot_interaction_scheduler():
             with app.app_context():
                 db = get_db()
                 active_interactions = db.execute("SELECT * FROM interaction_bots WHERE status = 'active'").fetchall()
-                now = datetime.now()
+                from datetime import timedelta
+                now = datetime.utcnow() + timedelta(hours=3)
                 
                 for interaction in active_interactions:
                     # 1. СНАЧАЛА достаем ID юзербота
@@ -1297,7 +1298,8 @@ def publish_scheduler():
                 db = get_db()
                 # Берем все активные публикации
                 pubs = db.execute("SELECT * FROM publications WHERE is_active = 1").fetchall()
-                now = datetime.now()
+                from datetime import timedelta
+                now = datetime.utcnow() + timedelta(hours=3)
                 
                 for pub in pubs:
                     pub_id = pub['id']
@@ -1723,7 +1725,8 @@ def google_sheets_scheduler():
                                 tc = db.execute("SELECT custom_name, chat_title FROM tracked_chats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)).fetchone()
                                 chat_title = tc['custom_name'] if tc and tc['custom_name'] else (tc['chat_title'] if tc else str(chat_id))
                                 
-                                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                from datetime import timedelta
+                                now_str = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
                                 msg_type = f"excel_{c_dict['id']}" 
                                 
                                 # Сохраняем сообщение в базу
@@ -1918,16 +1921,18 @@ async def fetch_chat_history(client, target_entity, chat_title, user_id, db_chat
                         continue
 
                     # ИСПРАВЛЕНИЕ: Форматируем дату вручную, чтобы не было DeprecationWarning
-                    msg_date = message.date.strftime("%Y-%m-%d %H:%M:%S")
+                    from datetime import timedelta
+                    msg_date = (message.date + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
 
                     db.execute(
                         'INSERT INTO messages (user_id, telegram_message_id, type, text, date, chat_id, chat_title, sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                         (user_id, message.id, msg_type, parsed_text, msg_date, db_chat_id, chat_title, sender_name)
                     )
+                    db.commit()
                     added += 1
                     
                     if added % 50 == 0:
-                        db.commit()
+                        
                         notify_clients()
                         
                 except sqlite3.IntegrityError:
@@ -2104,19 +2109,23 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
            
 
 # --- НОВЫЙ БЛОК: СЛУШАЕМ УДАЛЕНИЯ ---
+            # --- НОВЫЙ БЛОК: СЛУШАЕМ УДАЛЕНИЯ ---
             @client.on(MessageDeleted)
             async def deleted_handler(event):
                 with app.app_context():
                     db = get_db()
-                    for msg_id in event.deleted_ids:
-                        # УБРАЛИ проверку chat_id, так как в Telethon при удалении он часто равен None
-                        db.execute("""
-                            UPDATE product_messages 
-                            SET is_actual = 0 
-                            WHERE message_id IN (SELECT id FROM messages WHERE telegram_message_id = ?)
-                        """, (msg_id,))
-                    db.commit()
-                    notify_clients()
+                    try:
+                        for msg_id in event.deleted_ids:
+                            db.execute("""
+                                UPDATE product_messages 
+                                SET is_actual = 0 
+                                WHERE message_id IN (SELECT id FROM messages WHERE telegram_message_id = ?)
+                            """, (msg_id,))
+                        db.commit()
+                    except sqlite3.OperationalError as e:
+                        logger.warning(f"База занята, не удалось обновить удаленные сообщения: {e}")
+                    finally:
+                        notify_clients()
 
             @client.on(events.MessageEdited)
             async def edit_handler(event):
@@ -2310,7 +2319,8 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                     try:
                         # 1. Записываем новое сообщение
               
-                        msg_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        from datetime import timedelta
+                        msg_date = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
                         cursor = db.execute(
                             'INSERT INTO messages (user_id, telegram_message_id, type, text, date, chat_id, chat_title, sender_name, is_delayed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
                             (user_id, message.id, msg_type, parsed_text, msg_date, chat_id, chat_title, sender_name, is_delayed)
@@ -2374,7 +2384,8 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                         # Б. Безопасное удаление старых сообщений (разгружаем базу)
                         # Оставляем зазор в 5 минут, чтобы не сломать прайсы, которые бот отправляет несколькими сообщениями подряд
                         # Зазор 0 минут: как только пришел новый прайс, старый удаляется МГНОВЕННО
-                        cutoff_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        cutoff_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
                         db.execute("""
                             DELETE FROM messages 
                             WHERE chat_id = ? 
@@ -2800,7 +2811,8 @@ def api_parser_scheduler():
             try:
                 db = get_db()
                 sources = db.execute("SELECT * FROM api_sources WHERE is_active=1").fetchall()
-                now = datetime.now()
+                from datetime import timedelta
+                now = datetime.utcnow() + timedelta(hours=3)
                 
                 for src in sources:
                     src_id = src['id']
@@ -3344,7 +3356,8 @@ def parse_latest_excel_route(chat_id):
                         msg_type = 'channel' if message.is_channel else 'group' if message.is_group else 'private'
                         sender = await message.get_sender()
                         sender_name = f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip() or "Unknown"
-                        msg_date = message.date.strftime("%Y-%m-%d %H:%M:%S")
+                        from datetime import timedelta
+                        msg_date = (message.date + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
 
                         with app.app_context():
                             db = get_db()
@@ -9633,7 +9646,7 @@ def delayed_messages_scheduler():
                             # Очистка старых сообщений (зазор 5 минут)
                             
                             # Зазор 0 минут: как только пришел новый прайс, старый удаляется МГНОВЕННО
-                            cutoff_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            cutoff_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
                             db.execute("""
                                 DELETE FROM messages 
                                 WHERE chat_id = ? AND user_id = ? AND id != ? AND date < ?
