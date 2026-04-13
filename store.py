@@ -510,7 +510,7 @@ def manage_products():
             WHERE p.user_id = ?
         """
         products = db.execute(query, (user_id,)).fetchall()
-        return jsonify([dict(p) for p in products])
+        return jsonify([dict(ix) for ix in products])
         
     # POST
     # POST
@@ -4043,9 +4043,20 @@ TEMPLATE = """
 </div>
 
             <table class="messages-table">
-                <thead><tr><th>Название</th><th>Синонимы</th><th>Действия</th></tr></thead>
-                <tbody id="products-tbody"></tbody>
-            </table>
+    <thead>
+    <tr>
+        <th style="text-align: left; padding: 12px;">Название</th>
+        <th style="text-align: left; padding: 12px;">Бренд</th>
+        <th style="text-align: left; padding: 12px;">Модель</th>
+        <th style="text-align: left; padding: 12px;">Страна</th>
+        <th style="text-align: left; padding: 12px;">Вес</th>
+        <th style="text-align: left; padding: 12px;">Фото</th>
+        <th style="text-align: left; padding: 12px;">Синонимы</th>
+        <th style="text-align: left; padding: 12px; width: 120px;">Действия</th>
+    </tr>
+</thead>
+    <tbody id="products-tbody"></tbody>
+</table>
 
             <div id="product-binding-container" style="display: none; margin-top: 30px; border-top: 2px solid #3498db; padding-top: 20px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
@@ -4075,19 +4086,11 @@ TEMPLATE = """
     <h2 id="modal-title" style="margin-top:0;">Добавить товар</h2>
     
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
-        <div style="grid-column: span 2;">
-            <label>Название</label>
-            <input type="text" id="p-name" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
-        </div>
-        <div>
-            <label>Бренд</label>
-            <input type="text" id="p-brand" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
-        </div>
-        <div>
-            <label>Модель</label>
-            <input type="text" id="p-model" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
-        </div>
-    </div>
+    <div><label>Бренд</label><input type="text" id="p-brand" style="..."></div>
+    <div><label>Модель</label><input type="text" id="p-model" style="..."></div>
+    <div><label>Страна</label><input type="text" id="p-country" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;"></div>
+    <div><label>Вес</label><input type="text" id="p-weight" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;"></div>
+</div>
 
     <div style="margin-top:15px;">
         <label>Ссылка на фото</label>
@@ -4665,19 +4668,48 @@ let expandedFolders = new Set(JSON.parse(localStorage.getItem('expandedFolders')
         let currentProductFolderView = 'all'; // Текущий фильтр папки для товаров
 let currentBindingProductId = null;   // ID товара, который сейчас привязываем
 
-async function loadProductsFolderTree() {
-    const folders = await cachedApiFetch('/api/folders/tree');
-    const container = document.getElementById('products-folder-tree');
-    if (!container) return;
+async function loadProducts() {
+    // Принудительно обновляем данные
+    const prods = await cachedApiFetch('/api/products', true); 
+    const tbody = document.getElementById('products-tbody');
+    if (!tbody) return;
 
-    // Кнопка "Все товары"
-    container.innerHTML = `
-        <li data-id="all" class="${currentProductFolderView === 'all' ? 'active' : ''}" style="list-style: none; margin-bottom: 8px;">
-            <div onclick="filterProductsByFolder('all', 'Все товары')" style="cursor:pointer; padding: 5px; border-radius: 4px;">
-                <span class="folder-name" style="font-weight: bold;">📦 Все товары</span>
-            </div>
-        </li>
-    `;
+    const filtered = currentProductFolderView === 'all' 
+        ? prods 
+        : prods.filter(p => p.folder_id == currentProductFolderView);
+
+    tbody.innerHTML = filtered.map(p => {
+        // Экранируем данные, чтобы кавычки не ломали JS
+        const escape = (str) => String(str || '').replace(/'/g, "\\'").replace(/"/g, "&quot;");
+        
+        const hasConfirmed = p.confirmed_count > 0;
+        const rowBg = hasConfirmed ? 'transparent' : 'rgba(231, 76, 60, 0.2)';
+        const textColor = hasConfirmed ? '#ffffff' : '#ff4d4d'; // Яркий красный если нет подтверждений
+        
+        // Подготавливаем объект товара для передачи в модалку
+        const prodJson = JSON.stringify(p).replace(/"/g, '&quot;');
+
+        return `
+            <tr style="cursor: pointer; background: ${rowBg}; color: ${textColor}; transition: background 0.2s;" 
+                onclick="openProductBinding(${p.id}, '${escape(p.name)}')"
+                onmouseover="this.style.background='rgba(255,255,255,0.1)'" 
+                onmouseout="this.style.background='${rowBg}'">
+                
+                <td style="padding: 12px;"><strong>${hasConfirmed ? '' : '⚠️ '}${p.name}</strong></td>
+                <td style="padding: 12px;">${p.brand || '—'}</td>
+                <td style="padding: 12px;">${p.model_number || '—'}</td>
+                <td style="padding: 12px;">${p.country || '—'}</td>
+                <td style="padding: 12px;">${p.weight || '—'}</td>
+                <td style="padding: 12px; text-align: center;">${p.photo_url ? '🖼️' : '—'}</td>
+                <td style="padding: 12px; color: #aaa; font-size: 0.9em;">${p.synonyms || 'нет'}</td>
+                
+                <td style="padding: 12px; white-space: nowrap;" onclick="event.stopPropagation();">
+                    <button class="save-btn" onclick='openEditModal(${prodJson})' style="background:#f39c12; margin-right:4px;">✏️</button>
+                    <button class="save-btn" onclick="deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
+                </td>
+            </tr>
+        `}).join('');
+}
 
     function buildItem(folder, parent) {
         const li = document.createElement('li');
@@ -4736,7 +4768,7 @@ async function loadProductsFolderTree() {
     folders.forEach(f => {
         if (f.name !== 'По умолчанию') buildItem(f, container);
     });
-}
+
 
 function filterProductsByFolder(folderId, folderName) {
     currentProductFolderView = folderId;
@@ -8766,6 +8798,8 @@ function resetForm() {
     document.getElementById('p-brand').value = '';
     document.getElementById('p-model').value = '';
     document.getElementById('p-photo').value = '';
+    document.getElementById('p-country').value = '';
+document.getElementById('p-weight').value = '';
     document.getElementById('p-request').checked = false;
     document.getElementById('synonyms-list').innerHTML = '';
     addSynonymField(); // Добавляем одну пустую строку по умолчанию
@@ -8795,7 +8829,8 @@ function openAddModal() {
 function openEditModal(prod) {
     currentEditingId = prod.id;
     document.getElementById('modal-title').innerText = "Редактировать товар";
-    
+    document.getElementById('p-country').value = prod.country || "";
+document.getElementById('p-weight').value = prod.weight || "";
     document.getElementById('p-name').value = prod.name || "";
     document.getElementById('p-brand').value = prod.brand || "";
     document.getElementById('p-model').value = prod.model_number || "";
@@ -8823,6 +8858,8 @@ async function saveProductAction() {
         name: document.getElementById('p-name').value,
         brand: document.getElementById('p-brand').value,
         model_number: document.getElementById('p-model').value,
+        country: document.getElementById('p-country').value, // НОВОЕ
+        weight: document.getElementById('p-weight').value,
         photo_url: document.getElementById('p-photo').value,
         is_on_request: document.getElementById('p-request').checked ? 1 : 0,
         synonyms: synonymsArr
@@ -9878,4 +9915,4 @@ if __name__ == '__main__':
             start_message_listener(row['id'], row['user_id'], row['api_id'], row['api_hash'])
     # Запускаем планировщик взаимодействия с ботами
     threading.Thread(target=bot_interaction_scheduler, daemon=True).start()
-    socketio.run(app, debug=True, host='0.0.0.0', port=8080, use_reloader=False, allow_unsafe_werkzeug=True)
+    socketio.run(app, debug=True, host='0.0.0.0', port=80, use_reloader=False, allow_unsafe_werkzeug=True)
