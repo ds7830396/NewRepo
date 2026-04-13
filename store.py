@@ -4082,15 +4082,28 @@ TEMPLATE = """
     </div>
 </div>
 
-<div id="product-modal" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); background:#222; color:#fff; padding:30px; border-radius:15px; width:450px; z-index:2000; box-shadow:0 20px 60px rgba(0,0,0,0.7); border:1px solid #444;">
-    <h2 id="modal-title" style="margin-top:0;">Добавить товар</h2>
-    
-    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
-    <div><label>Бренд</label><input type="text" id="p-brand" style="..."></div>
-    <div><label>Модель</label><input type="text" id="p-model" style="..."></div>
-    <div><label>Страна</label><input type="text" id="p-country" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;"></div>
-    <div><label>Вес</label><input type="text" id="p-weight" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;"></div>
-</div>
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+        <div style="grid-column: span 2;">
+            <label>Название</label>
+            <input type="text" id="p-name" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+        </div>
+        <div>
+            <label>Бренд</label>
+            <input type="text" id="p-brand" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+        </div>
+        <div>
+            <label>Модель №</label>
+            <input type="text" id="p-model" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+        </div>
+        <div>
+            <label>Страна</label>
+            <input type="text" id="p-country" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+        </div>
+        <div>
+            <label>Вес</label>
+            <input type="text" id="p-weight" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+        </div>
+    </div>
 
     <div style="margin-top:15px;">
         <label>Ссылка на фото</label>
@@ -4668,48 +4681,6 @@ let expandedFolders = new Set(JSON.parse(localStorage.getItem('expandedFolders')
         let currentProductFolderView = 'all'; // Текущий фильтр папки для товаров
 let currentBindingProductId = null;   // ID товара, который сейчас привязываем
 
-async function loadProducts() {
-    // Принудительно обновляем данные
-    const prods = await cachedApiFetch('/api/products', true); 
-    const tbody = document.getElementById('products-tbody');
-    if (!tbody) return;
-
-    const filtered = currentProductFolderView === 'all' 
-        ? prods 
-        : prods.filter(p => p.folder_id == currentProductFolderView);
-
-    tbody.innerHTML = filtered.map(p => {
-        // Экранируем данные, чтобы кавычки не ломали JS
-        const escape = (str) => String(str || '').replace(/'/g, "\\'").replace(/"/g, "&quot;");
-        
-        const hasConfirmed = p.confirmed_count > 0;
-        const rowBg = hasConfirmed ? 'transparent' : 'rgba(231, 76, 60, 0.2)';
-        const textColor = hasConfirmed ? '#ffffff' : '#ff4d4d'; // Яркий красный если нет подтверждений
-        
-        // Подготавливаем объект товара для передачи в модалку
-        const prodJson = JSON.stringify(p).replace(/"/g, '&quot;');
-
-        return `
-            <tr style="cursor: pointer; background: ${rowBg}; color: ${textColor}; transition: background 0.2s;" 
-                onclick="openProductBinding(${p.id}, '${escape(p.name)}')"
-                onmouseover="this.style.background='rgba(255,255,255,0.1)'" 
-                onmouseout="this.style.background='${rowBg}'">
-                
-                <td style="padding: 12px;"><strong>${hasConfirmed ? '' : '⚠️ '}${p.name}</strong></td>
-                <td style="padding: 12px;">${p.brand || '—'}</td>
-                <td style="padding: 12px;">${p.model_number || '—'}</td>
-                <td style="padding: 12px;">${p.country || '—'}</td>
-                <td style="padding: 12px;">${p.weight || '—'}</td>
-                <td style="padding: 12px; text-align: center;">${p.photo_url ? '🖼️' : '—'}</td>
-                <td style="padding: 12px; color: #aaa; font-size: 0.9em;">${p.synonyms || 'нет'}</td>
-                
-                <td style="padding: 12px; white-space: nowrap;" onclick="event.stopPropagation();">
-                    <button class="save-btn" onclick='openEditModal(${prodJson})' style="background:#f39c12; margin-right:4px;">✏️</button>
-                    <button class="save-btn" onclick="deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
-                </td>
-            </tr>
-        `}).join('');
-}
 
     
 
@@ -5281,35 +5252,88 @@ qrBtn.addEventListener('click', async () => {
 
         // ЗАГРУЗКА И ОТРИСОВКА ТОВАРОВ
     async function loadProducts() {
+    // 1. Принудительно обновляем данные
     const prods = await cachedApiFetch('/api/products', true); 
     const tbody = document.getElementById('products-tbody');
     if (!tbody) return;
 
+    // 2. Фильтруем по папке
     const filtered = currentProductFolderView === 'all' 
         ? prods 
         : prods.filter(p => p.folder_id == currentProductFolderView);
 
     tbody.innerHTML = filtered.map(p => {
-        const safe = (field) => String(field || '').replace(/['"]/g, '`');
+        // Защита от кавычек в названиях
+        const safeName = String(p.name || '').replace(/'/g, "\\'").replace(/"/g, "&quot;");
+        
+        // Логика цвета: если нет подтвержденных сообщений — ЯРКО КРАСНЫЙ
         const hasConfirmed = p.confirmed_count > 0;
-        const color = hasConfirmed ? '#ffffff' : '#ff4d4d';
+        const rowBg = hasConfirmed ? 'transparent' : 'rgba(231, 76, 60, 0.15)';
+        const textColor = hasConfirmed ? '#ffffff' : '#ff4d4d';
+        
+        // Подготовка объекта для кнопки редактирования (чтобы не ломать JS кавычками)
+        const prodJson = JSON.stringify(p).replace(/"/g, '&quot;');
 
         return `
-            <tr style="cursor: pointer; color: ${color};" onclick="openProductBinding(${p.id}, '${safe(p.name)}')">
-                <td><strong>${hasConfirmed ? '' : '⚠️ '}${p.name}</strong></td>
+            <tr style="cursor: pointer; background: ${rowBg}; color: ${textColor}; transition: 0.2s;" 
+                onclick="openProductBinding(${p.id}, '${safeName}')">
+                <td style="padding: 12px;"><strong>${hasConfirmed ? '' : '⚠️ '}${p.name}</strong></td>
                 <td>${p.brand || '—'}</td>
                 <td>${p.model_number || '—'}</td>
                 <td>${p.country || '—'}</td>
                 <td>${p.weight || '—'}</td>
-                <td>${p.photo_url ? '🖼️' : '—'}</td>
-                <td style="color: #aaa;">${p.synonyms || 'нет'}</td>
-                <td onclick="event.stopPropagation();">
-                    <button class="save-btn" onclick="openEditModal(${JSON.stringify(p).replace(/"/g, '&quot;')})" style="background:#f39c12;">✏️</button>
+                <td style="text-align: center;">${p.photo_url ? '🖼️' : '—'}</td>
+                <td style="color: #aaa; font-size: 0.9em;">${p.synonyms || 'нет'}</td>
+                <td style="white-space: nowrap;" onclick="event.stopPropagation();">
+                    <button class="save-btn" onclick='openEditModal(${prodJson})' style="background:#f39c12; margin-right:4px;">✏️</button>
                     <button class="save-btn" onclick="deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
                 </td>
             </tr>
         `;
     }).join('');
+}
+
+// ФУНКЦИЯ ОЧИСТКИ ФОРМЫ (Исправлена для новых ID)
+function resetForm() {
+    const fields = ['p-name', 'p-brand', 'p-model', 'p-country', 'p-weight', 'p-photo'];
+    fields.forEach(id => {
+        const el = document.getElementById(id);
+        if(el) el.value = '';
+    });
+    const req = document.getElementById('p-request');
+    if(req) req.checked = false;
+    
+    const container = document.getElementById('synonyms-list');
+    if(container) {
+        container.innerHTML = '';
+        addSynonymField(); 
+    }
+}
+
+// ФУНКЦИЯ РЕДАКТИРОВАНИЯ (Исправлена)
+function openEditModal(prod) {
+    currentEditingId = prod.id;
+    document.getElementById('modal-title').innerText = "Редактировать товар";
+    
+    // Безопасное заполнение полей
+    if(document.getElementById('p-name')) document.getElementById('p-name').value = prod.name || "";
+    if(document.getElementById('p-brand')) document.getElementById('p-brand').value = prod.brand || "";
+    if(document.getElementById('p-model')) document.getElementById('p-model').value = prod.model_number || "";
+    if(document.getElementById('p-country')) document.getElementById('p-country').value = prod.country || "";
+    if(document.getElementById('p-weight')) document.getElementById('p-weight').value = prod.weight || "";
+    if(document.getElementById('p-photo')) document.getElementById('p-photo').value = prod.photo_url || "";
+    if(document.getElementById('p-request')) document.getElementById('p-request').checked = (prod.is_on_request === 1);
+    
+    const container = document.getElementById('synonyms-list');
+    if(container) {
+        container.innerHTML = "";
+        if (prod.synonyms) {
+            prod.synonyms.split(',').forEach(s => addSynonymField(s.trim()));
+        } else {
+            addSynonymField();
+        }
+    }
+    document.getElementById('product-modal').style.display = 'block';
 }
 
         // РЕДАКТИРОВАНИЕ ТОВАРА
@@ -8808,18 +8832,7 @@ function closeProductModal() {
     document.getElementById('product-modal').style.display = 'none';
 }
 
-// 2. ФУНКЦИЯ ОЧИСТКИ ФОРМЫ
-function resetForm() {
-    document.getElementById('p-name').value = '';
-    document.getElementById('p-brand').value = '';
-    document.getElementById('p-model').value = '';
-    document.getElementById('p-photo').value = '';
-    document.getElementById('p-country').value = '';
-document.getElementById('p-weight').value = '';
-    document.getElementById('p-request').checked = false;
-    document.getElementById('synonyms-list').innerHTML = '';
-    addSynonymField(); // Добавляем одну пустую строку по умолчанию
-}
+
 
 // 3. ДОБАВЛЕНИЕ СТРОКИ СИНОНИМА
 function addSynonymField(value = "") {
@@ -8842,27 +8855,7 @@ function openAddModal() {
 }
 
 // 5. ОТКРЫТИЕ ОКНА ДЛЯ РЕДАКТИРОВАНИЯ (Кнопка "✏️")
-function openEditModal(prod) {
-    currentEditingId = prod.id;
-    document.getElementById('modal-title').innerText = "Редактировать товар";
-    document.getElementById('p-country').value = prod.country || "";
-document.getElementById('p-weight').value = prod.weight || "";
-    document.getElementById('p-name').value = prod.name || "";
-    document.getElementById('p-brand').value = prod.brand || "";
-    document.getElementById('p-model').value = prod.model_number || "";
-    document.getElementById('p-photo').value = prod.photo_url || "";
-    document.getElementById('p-request').checked = prod.is_on_request === 1;
-    
-    const container = document.getElementById('synonyms-list');
-    container.innerHTML = "";
-    if (prod.synonyms) {
-        prod.synonyms.split(',').forEach(s => addSynonymField(s.trim()));
-    } else {
-        addSynonymField(); // Пустое поле если синонимов нет
-    }
-    
-    document.getElementById('product-modal').style.display = 'block';
-}
+
 
 // 6. ОТПРАВКА ДАННЫХ (Кнопка "СОХРАНИТЬ")
 async function saveProductAction() {
