@@ -1087,7 +1087,7 @@ def edit_product(prod_id):
         
     db.execute("""
         UPDATE products 
-        SET name=?, synonyms=?, photo_url=?, brand=?, country=?, weight=?, model_number=?, is_on_request=?
+        SET name=?, synonyms=?, photo_url=?, brand=?, country=?, weight=?, model_number=?, is_on_request=?, folder_id=?
         WHERE id=? AND user_id=?
     """, (
         data.get('name'), 
@@ -1098,6 +1098,7 @@ def edit_product(prod_id):
         data.get('weight'),
         data.get('model_number'),
         1 if data.get('is_on_request') else 0,
+        data.get('folder_id'), # <--- ВОТ ЭТА СТРОКА СОХРАНИТ ПАПКУ
         prod_id, 
         session['user_id']
     ))
@@ -4128,7 +4129,12 @@ TEMPLATE = """
         <div id="synonyms-list" style="max-height:150px; overflow-y:auto; margin-bottom:10px;"></div>
         <button type="button" onclick="addSynonymField()" style="width:100%; padding:8px; background:none; border:1px dashed #4a90e2; color:#4a90e2; cursor:pointer; border-radius:4px; transition: 0.2s;">+ Добавить синоним</button>
     </div>
-
+    <div style="margin-top:15px;">
+        <label style="color:#aaa; font-size:12px;">Папка (Категория)</label>
+        <select id="p-folder-id" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
+            <option value="">Без папки (Общие)</option>
+        </select>
+    </div>
     <div style="margin-top:15px;">
         <label style="color:#ddd; font-size:13px; cursor:pointer; display: flex; align-items: center; gap: 8px;">
             <input type="checkbox" id="p-request" style="width: 16px; height: 16px;"> Цена по запросу
@@ -5314,6 +5320,13 @@ function resetForm() {
         const el = document.getElementById(id);
         if(el) el.value = '';
     });
+    
+    // Авто-подстановка текущей открытой папки
+    const fSelect = document.getElementById('p-folder-id');
+    if (fSelect) {
+        fSelect.value = (typeof currentProductFolderView !== 'undefined' && currentProductFolderView !== 'all') ? currentProductFolderView : '';
+    }
+
     const req = document.getElementById('p-request');
     if(req) req.checked = false;
     
@@ -5337,7 +5350,7 @@ function openEditModal(prod) {
     if(document.getElementById('p-weight')) document.getElementById('p-weight').value = prod.weight || "";
     if(document.getElementById('p-photo')) document.getElementById('p-photo').value = prod.photo_url || "";
     if(document.getElementById('p-request')) document.getElementById('p-request').checked = (prod.is_on_request === 1);
-    
+    if(document.getElementById('p-folder-id')) document.getElementById('p-folder-id').value = prod.folder_id || "";
     const container = document.getElementById('synonyms-list');
     if(container) {
         container.innerHTML = "";
@@ -6767,7 +6780,7 @@ document.querySelectorAll('.delete-chat').forEach(btn => {
             syncActiveFolder();
             
             const folderSelect = document.getElementById('folder-select');
-            const prodFolderSelect = document.getElementById('prod_folder_id');
+            const prodFolderSelect = document.getElementById('p-folder-id');
             
             if(folderSelect) folderSelect.innerHTML = '';
             if(prodFolderSelect) prodFolderSelect.innerHTML = '<option value="">Без папки (Общие)</option>';
@@ -8875,17 +8888,18 @@ function openAddModal() {
 async function saveProductAction() {
     const synInputs = document.querySelectorAll('.synonym-input');
     const synonymsArr = Array.from(synInputs).map(i => i.value.trim()).filter(v => v !== "");
-    
+    const folderIdVal = document.getElementById('p-folder-id').value;
     // Собираем данные
     const payload = {
         name: document.getElementById('p-name').value,
         brand: document.getElementById('p-brand').value,
         model_number: document.getElementById('p-model').value,
-        country: document.getElementById('p-country').value, // НОВОЕ
+        country: document.getElementById('p-country').value,
         weight: document.getElementById('p-weight').value,
         photo_url: document.getElementById('p-photo').value,
         is_on_request: document.getElementById('p-request').checked ? 1 : 0,
-        synonyms: synonymsArr
+        synonyms: synonymsArr,
+        folder_id: folderIdVal ? parseInt(folderIdVal) : null // <--- ОТПРАВЛЯЕМ ПАПКУ НА СЕРВЕР
     };
 
     const url = currentEditingId ? `/api/products/${currentEditingId}` : '/api/products';
