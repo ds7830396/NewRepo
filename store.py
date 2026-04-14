@@ -1583,8 +1583,9 @@ def get_catalog_for_client(client_id):
         else: markups[m['folder_id']] = dict(m)
             
     # ДОБАВЛЕНО: latest_chat_id (извлекаем чат, из которого была подтверждена последняя цена)
+    
     products_raw = db.execute("""
-        SELECT p.id, p.name, p.folder_id, p.price as manual_price,
+        SELECT p.id, p.name, p.folder_id, p.price as manual_price, p.photo_url, p.brand, p.country, p.weight, p.model_number, p.is_on_request,
                (SELECT pm.extracted_price FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as parsed_price,
                (SELECT pm.is_actual FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as is_actual,
                (SELECT m.chat_id FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as latest_chat_id
@@ -1638,7 +1639,13 @@ def get_catalog_for_client(client_id):
             'id': p['id'],
             'name': p['name'],
             'category_id': p['folder_id'],
-            'price': int(final_price)
+            'price': int(final_price),
+            'photo_url': p['photo_url'],
+            'brand': p['brand'],
+            'country': p['country'],
+            'weight': p['weight'],
+            'model_number': p['model_number'],
+            'is_on_request': bool(p['is_on_request'])
         })
         
         if p['folder_id']:
@@ -4082,48 +4089,55 @@ TEMPLATE = """
     </div>
 </div>
 
-<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+<div id="product-modal" style="display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2a2a2a; padding: 25px; border-radius: 8px; z-index: 1000; border: 1px solid #4a90e2; box-shadow: 0 10px 30px rgba(0,0,0,0.7); min-width: 400px; max-height: 90vh; overflow-y: auto;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+        <h3 id="modal-title" style="margin: 0; color: #fff; font-size: 20px;">Добавить товар</h3>
+        <button onclick="closeProductModal()" style="background: none; border: none; color: #aaa; cursor: pointer; font-size: 18px;">❌</button>
+    </div>
+
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
         <div style="grid-column: span 2;">
-            <label>Название</label>
-            <input type="text" id="p-name" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+            <label style="color:#aaa; font-size:12px;">Название</label>
+            <input type="text" id="p-name" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
         </div>
         <div>
-            <label>Бренд</label>
-            <input type="text" id="p-brand" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+            <label style="color:#aaa; font-size:12px;">Бренд</label>
+            <input type="text" id="p-brand" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
         </div>
         <div>
-            <label>Модель №</label>
-            <input type="text" id="p-model" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+            <label style="color:#aaa; font-size:12px;">Модель №</label>
+            <input type="text" id="p-model" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
         </div>
         <div>
-            <label>Страна</label>
-            <input type="text" id="p-country" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+            <label style="color:#aaa; font-size:12px;">Страна</label>
+            <input type="text" id="p-country" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
         </div>
         <div>
-            <label>Вес</label>
-            <input type="text" id="p-weight" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+            <label style="color:#aaa; font-size:12px;">Вес</label>
+            <input type="text" id="p-weight" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
         </div>
     </div>
 
     <div style="margin-top:15px;">
-        <label>Ссылка на фото</label>
-        <input type="text" id="p-photo" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff;">
+        <label style="color:#aaa; font-size:12px;">Ссылка на фото</label>
+        <input type="text" id="p-photo" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
     </div>
 
     <div style="margin-top:20px; border-top:1px solid #444; padding-top:15px;">
         <label style="color:#4a90e2; font-size:12px; font-weight:bold;">СИНОНИМЫ (Ключевые слова)</label>
-        <div id="synonyms-list" style="max-height:150px; overflow-y:auto; margin-bottom:10px;">
-            </div>
-        <button type="button" onclick="addSynonymField()" style="width:100%; padding:5px; background:none; border:1px dashed #4a90e2; color:#4a90e2; cursor:pointer;">+ Добавить синоним</button>
+        <div id="synonyms-list" style="max-height:150px; overflow-y:auto; margin-bottom:10px;"></div>
+        <button type="button" onclick="addSynonymField()" style="width:100%; padding:8px; background:none; border:1px dashed #4a90e2; color:#4a90e2; cursor:pointer; border-radius:4px; transition: 0.2s;">+ Добавить синоним</button>
     </div>
 
     <div style="margin-top:15px;">
-        <label><input type="checkbox" id="p-request"> Цена по запросу</label>
+        <label style="color:#ddd; font-size:13px; cursor:pointer; display: flex; align-items: center; gap: 8px;">
+            <input type="checkbox" id="p-request" style="width: 16px; height: 16px;"> Цена по запросу
+        </label>
     </div>
 
     <div style="margin-top:25px; display:flex; gap:10px;">
-        <button onclick="saveProductAction()" style="flex:1; padding:10px; background:#27ae60; border:none; color:white; font-weight:bold; cursor:pointer;">СОХРАНИТЬ</button>
-        <button onclick="closeProductModal()" style="padding:10px; background:#c0392b; border:none; color:white; cursor:pointer;">ОТМЕНА</button>
+        <button onclick="saveProductAction()" style="flex:1; padding:12px; background:#27ae60; border:none; color:white; font-weight:bold; cursor:pointer; border-radius:4px; transition: 0.2s;">СОХРАНИТЬ</button>
+        <button onclick="closeProductModal()" style="padding:12px 20px; background:#c0392b; border:none; color:white; cursor:pointer; border-radius:4px; transition: 0.2s;">ОТМЕНА</button>
     </div>
 </div>
 
@@ -9272,7 +9286,8 @@ def public_api_catalog():
             markups[m['folder_id']] = dict(m)
 
     # 1. Получаем базовую информацию обо всех товарах
-    products_raw = db.execute("SELECT id, name, folder_id, price as manual_price FROM products WHERE user_id = ?", (user_id,)).fetchall()
+
+    products_raw = db.execute("SELECT id, name, folder_id, price as manual_price, photo_url, brand, country, weight, model_number, is_on_request FROM products WHERE user_id = ?", (user_id,)).fetchall()
     
     # 2. Получаем ВСЕ актуальные цены, чтобы потом отфильтровать их по нужным поставщикам
     prices_raw = db.execute("""
@@ -9350,7 +9365,13 @@ def public_api_catalog():
             'id': p['id'],
             'name': p['name'],
             'category_id': p['folder_id'],
-            'price': int(final_price)
+            'price': int(final_price),
+            'photo_url': p['photo_url'],
+            'brand': p['brand'],
+            'country': p['country'],
+            'weight': p['weight'],
+            'model_number': p['model_number'],
+            'is_on_request': bool(p['is_on_request'])
         })
         
         if p['folder_id']:
@@ -9924,4 +9945,4 @@ if __name__ == '__main__':
             start_message_listener(row['id'], row['user_id'], row['api_id'], row['api_hash'])
     # Запускаем планировщик взаимодействия с ботами
     threading.Thread(target=bot_interaction_scheduler, daemon=True).start()
-    socketio.run(app, debug=True, host='0.0.0.0', port=80, use_reloader=False, allow_unsafe_werkzeug=True)
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000, use_reloader=False, allow_unsafe_werkzeug=True)
