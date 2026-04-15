@@ -1695,7 +1695,7 @@ def get_catalog_for_client(client_id):
         access_rules = {}
         
     for p in products_raw:
-        if p['is_actual'] == 0: continue
+       
             
         # --- ТОЧЕЧНЫЙ ФИЛЬТР ПО ДЕРЕВУ ---
         if not access_rules: continue # Если клиенту ничего не настроено - отдаем пустой прайс
@@ -1712,7 +1712,22 @@ def get_catalog_for_client(client_id):
                 continue # Цена от этого поставщика запрещена
         # ---------------------------------
         
-        base_price = float(p['parsed_price'] if p['parsed_price'] is not None else (p['manual_price'] or 0))
+        # Используем актуальную спарсенную цену или ручную
+        base_price = float(p['parsed_price'] if (p['parsed_price'] is not None and p['is_actual'] == 1) else (p['manual_price'] or 0))
+        
+        if base_price > 0 and not p['is_on_request']:
+            mk = markups.get(p['folder_id'], default_markup)
+            if mk['markup_type'] == 'percent':
+                final_price = base_price * (1 + mk['markup_value'] / 100)
+            else:
+                final_price = base_price + mk['markup_value']
+                
+            rnd = mk['rounding']
+            if rnd > 0:
+                final_price = math.ceil(final_price / rnd) * rnd
+            final_price = int(final_price)
+        else:
+            final_price = "По запросу"
         
    
             
@@ -1947,7 +1962,11 @@ def google_sheets_scheduler():
                                             db.execute("UPDATE product_messages SET is_actual = 0 WHERE id = ?", (b['id'],))
                                             
                                 # Чистим старые сообщения этого листа
-                                db.execute("DELETE FROM messages WHERE chat_id = ? AND user_id = ? AND id != ? AND type = ?", (chat_id, user_id, new_msg_id, msg_type))
+                                db.execute("""
+                                    DELETE FROM messages 
+                                    WHERE chat_id = ? AND user_id = ? AND id != ? AND type = ? 
+                                    AND id NOT IN (SELECT message_id FROM product_messages)
+                                """, (chat_id, user_id, new_msg_id, msg_type))
                                 
                                 # --- АВТО-ПРИВЯЗКА НОВЫХ ---
                                 all_prods = db.execute("SELECT id, synonyms FROM products WHERE user_id=?", (user_id,)).fetchall()
@@ -2620,11 +2639,12 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                         """, (chat_id, user_id, new_msg_id, cutoff_time))
                         
                         # 2. Безопасно удаляем старые сообщения
+                        # 2. Безопасно удаляем старые сообщения (оставляем те, где есть ЛЮБЫЕ привязки)
                         db.execute("""
                             DELETE FROM messages 
                             WHERE chat_id = ? AND user_id = ? AND id != ? AND date < ?
-                              AND id NOT IN (SELECT message_id FROM product_messages WHERE is_actual = 1)
-                        """, (chat_id, user_id, new_msg_id, cutoff_time))
+                                AND id NOT IN (SELECT message_id FROM product_messages)
+                        """, (chat_id, user_id, new_msg_id, cutoff_time)) # Для планировщика тут останется msg_id
                         
                         db.commit()
                         # =======================================================================
@@ -9173,8 +9193,10 @@ async function saveProductAction() {
         
         // Перезагружаем список товаров
         loadProducts();
+        document.getElementById('p-photos').value = '';
     } else {
         alert('Ошибка при сохранении товара');
+        document.getElementById('p-photos').value = '';
     }
 }
 async function savePubMarkup() {
@@ -9610,22 +9632,27 @@ def public_api_catalog():
                     best_price = pr['extracted_price']
                     break # Нашли правильную цену!
 
+        # Устанавливаем базовую цену
         base_price = float(best_price if best_price is not None else (p['manual_price'] or 0))
         
-        # Если цены вообще нет — пропускаем
-        if base_price == 0:
-            continue
-
-        mk = markups.get(p['folder_id'], default_markup)
-        if mk['markup_type'] == 'percent':
-            final_price = base_price * (1 + mk['markup_value'] / 100)
+        # НОВАЯ ЛОГИКА ЦЕНЫ (вместо пропуска товара)
+        if base_price > 0 and not p['is_on_request']:
+            # Цена есть и товар не "по запросу" - считаем наценку
+            mk = markups.get(p['folder_id'], default_markup)
+            if mk['markup_type'] == 'percent':
+                final_price = base_price * (1 + mk['markup_value'] / 100)
+            else:
+                final_price = base_price + mk['markup_value']
+                
+            rnd = mk['rounding']
+            if rnd > 0:
+                final_price = math.ceil(final_price / rnd) * rnd
+                
+            final_price = int(final_price) # Отдаем числом
         else:
-            final_price = base_price + mk['markup_value']
-            
-        rnd = mk['rounding']
-        if rnd > 0:
-            final_price = math.ceil(final_price / rnd) * rnd
-            
+            # Цены нет у поставщиков ИЛИ стоит ручная галочка "По запросу"
+            final_price = "По запросу"
+
         domain = "https://engine.astoredirect.ru" 
         
         # Формируем полные ссылки на файлы
