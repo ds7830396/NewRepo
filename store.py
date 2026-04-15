@@ -21,6 +21,14 @@ import json
 from flask_socketio import SocketIO, emit
 from telethon.events import MessageDeleted
 
+
+import os
+import uuid
+import json
+from werkzeug.utils import secure_filename
+from flask import send_from_directory
+
+
 import secrets
 import math
 import pandas as pd
@@ -37,7 +45,18 @@ app.secret_key = 'supersecretkey_for_demo'
 app.config['DATABASE'] = 'app.db'
 app.json.ensure_ascii = False
 # ПЕРЕНЕСТИ СЮДА (строки, которые сейчас перед шаблонами)
-socketio = SocketIO(app, cors_allowed_origins="*") 
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_timeout=120, ping_interval=25) 
+
+
+# Настройка папки для хранения фото
+UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# НОВЫЙ МАРШРУТ: Отдаем загруженные файлы по ссылке
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 def notify_clients(data_type="general"):
     socketio.emit('db_updated', {'type': data_type})
@@ -130,57 +149,66 @@ def bot_interaction_scheduler():
                 db = get_db()
                 active_interactions = db.execute("SELECT * FROM interaction_bots WHERE status = 'active'").fetchall()
                 from datetime import timedelta
-                now = datetime.utcnow() + timedelta(hours=3)
+                now = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
                 
                 for interaction in active_interactions:
-                    # 1. СНАЧАЛА достаем ID юзербота
-                    userbot_id = interaction['userbot_id']
-                    
-                    # 2. ЗАТЕМ проверяем, рабочее ли у него сейчас время
-                    if not is_parsing_allowed(userbot_id):
-                        continue 
+                    # Оборачиваем КАЖДОГО бота в свой try..except, чтобы ошибка в одном не ломала других
+                    try:
+                        userbot_id = interaction['userbot_id']
                         
-                    last_run = interaction['last_run']
-                    if last_run:
-                        # Учитываем формат времени SQLite
-                        try:
-                            last_run_dt = datetime.strptime(last_run, '%Y-%m-%d %H:%M:%S.%f')
-                        except ValueError:
-                            last_run_dt = datetime.strptime(last_run, '%Y-%m-%d %H:%M:%S')
+                        if not is_parsing_allowed(userbot_id):
+                            continue 
                             
-                        diff_minutes = (now - last_run_dt).total_seconds() / 60
-                        if diff_minutes < interaction['interval_minutes']:
-                            continue  # Время еще не пришло
-                    
-                    # Если время пришло, отправляем команды
-                    # Если время пришло, отправляем команды
-                    if userbot_id in user_clients:
-                        _, client, _ = user_clients[userbot_id]
-                        loop = user_loops.get(userbot_id)
+                        last_run = interaction['last_run']
+                        if last_run:
+                            try:
+                                last_run_dt = datetime.strptime(last_run, '%Y-%m-%d %H:%M:%S.%f')
+                            except ValueError:
+                                last_run_dt = datetime.strptime(last_run, '%Y-%m-%d %H:%M:%S')
+                                
+                            diff_minutes = (now - last_run_dt).total_seconds() / 60
+                            if diff_minutes < interaction['interval_minutes']:
+                                continue  # Время еще не пришло
                         
-                        # ДОБАВЛЕНА ПРОВЕРКА client.is_connected()
-                        if loop and loop.is_running() and client.is_connected():
-                            commands = json.loads(interaction['commands'])
-                            bot_username = interaction['bot_username']
+                        if userbot_id in user_clients:
+                            _, client, _ = user_clients[userbot_id]
+                            loop = user_loops.get(userbot_id)
                             
-                            # Отправляем команды по очереди
-                            # Отправляем команды по очереди
-                            for cmd in commands:
-                                try:
-                                    asyncio.run_coroutine_threadsafe(client.send_message(bot_username, cmd), loop)
-                                except Exception as e:
-                                    logger.error(f"Не удалось отправить команду боту (сессия закрыта): {e}")
-                                time.sleep(2) # Небольшая пауза между командами
-                            
-                            # Обновляем время последнего запуска
-                            db.execute("UPDATE interaction_bots SET last_run = ? WHERE id = ?", (now, interaction['id']))
-                            db.commit()
-                            
-                            if 'notify_clients' in globals():
-                                notify_clients()
+                            if loop and loop.is_running() and client.is_connected():
+                                commands = json.loads(interaction['commands'])
+                                bot_username = interaction['bot_username']
+                                
+                                logger.info(f"🔄 Запуск команд для бота {bot_username}...")
+                                
+                                for cmd in commands:
+                                    # Асинхронная обертка для гарантированной отправки и получения ошибок
+                                    async def send_cmd(target, text):
+                                        # get_entity заставляет Telethon "вспомнить" бота перед отправкой
+                                        entity = await client.get_entity(target)
+                                        await client.send_message(entity, text)
+                                    
+                                    try:
+                                        # Запускаем и ЖДЕМ результат максимум 15 секунд
+                                        future = asyncio.run_coroutine_threadsafe(send_cmd(bot_username, cmd), loop)
+                                        future.result(timeout=15) 
+                                        logger.info(f"✅ Успешно отправлена команда '{cmd}' боту {bot_username}")
+                                    except Exception as e:
+                                        logger.error(f"❌ Ошибка отправки '{cmd}' боту {bot_username}: {e}")
+                                        
+                                    time.sleep(2) # Небольшая пауза между командами
+                                
+                                # Обновляем время последнего запуска
+                                db.execute("UPDATE interaction_bots SET last_run = ? WHERE id = ?", (now, interaction['id']))
+                                db.commit()
+                                
+                                if 'notify_clients' in globals():
+                                    notify_clients()
+                                    
+                    except Exception as bot_e:
+                        logger.error(f"Сбой в логике расписания для бота {interaction['bot_username']}: {bot_e}")
                              
         except Exception as e:
-            logger.error(f"Ошибка в планировщике ботов: {e}")
+            logger.error(f"Глобальная ошибка в планировщике ботов: {e}")
 
 
 
@@ -515,29 +543,50 @@ def manage_products():
     # POST
     # POST
     # POST
-    data = request.get_json()
-    folder_id = data.get('folder_id')
+    # POST
+    # Так как мы передаем файлы, используем request.form, а не get_json()
+    folder_id = request.form.get('folder_id')
     
-    # Обработка синонимов (из массива в строку)
-    syns = data.get('synonyms', [])
-    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()]) if isinstance(syns, list) else (syns or '')
+    # 1. Обработка синонимов (теперь они приходят из формы)
+    try:
+        syns = json.loads(request.form.get('synonyms', '[]'))
+    except:
+        syns = []
+    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
+    
+    # 2. ВСТАВЛЯЕМ ВАШ НОВЫЙ КОД ДЛЯ ФОТО ЗДЕСЬ:
+    files = request.files.getlist('photos')
+    saved_names = []
+    for file in files:
+        if file and file.filename:
+            # Генерируем уникальное имя, чтобы не было конфликтов
+            ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else 'jpg'
+            filename = f"{uuid.uuid4().hex}.{ext}"
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            saved_names.append(filename)
 
+    # Сохраняем в БД просто как строку через запятую: "id1.jpg, id2.jpg"
+    photo_url_str = ",".join(saved_names) 
+
+    # 3. Сохраняем все в базу данных
     db.execute("""
         INSERT INTO products 
         (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id, 
-        data.get('name'), 
+        request.form.get('name'), 
         synonyms_str, 
-        data.get('price', 0.0), 
+        float(request.form.get('price', 0.0)), 
         folder_id,
-        data.get('photo_url'),
-        data.get('brand'),
-        data.get('country'),
-        data.get('weight'),
-        data.get('model_number'),
-        1 if data.get('is_on_request') else 0
+        
+        photo_url_str,  # <--- Передаем нашу строку с именами файлов
+        
+        request.form.get('brand'),
+        request.form.get('country'),
+        request.form.get('weight'),
+        request.form.get('model_number'),
+        1 if request.form.get('is_on_request') == '1' else 0
     ))
     db.commit()
     notify_clients()
@@ -717,10 +766,6 @@ def manage_interaction_bots():
     # 5. ПАРСИНГ ИСТОРИИ (также по числовому ID)
     # 5. ПАРСИНГ ИСТОРИИ 
     chat_title_for_parser = custom_name if custom_name else bot_username
-    asyncio.run_coroutine_threadsafe(
-        fetch_chat_history(client_to_use, bot_username, chat_title_for_parser, user_id, numeric_chat_id), 
-        client_loop_to_use
-    )
 
     return jsonify({'success': True})
 
@@ -728,7 +773,24 @@ def manage_interaction_bots():
 @login_required
 def delete_interaction_bot(id):
     db = get_db()
-    db.execute("DELETE FROM interaction_bots WHERE id=? AND user_id=?", (id, session['user_id']))
+    user_id = session['user_id']
+    
+    # 1. Находим бота перед удалением
+    bot = db.execute("SELECT bot_username FROM interaction_bots WHERE id=? AND user_id=?", (id, user_id)).fetchone()
+    if bot:
+        bot_un = bot['bot_username']
+        # 2. Ищем его в отслеживаемых чатах и удаляем все его настройки и сохраненные сообщения
+        tc_list = db.execute("SELECT id, chat_id FROM tracked_chats WHERE user_id=? AND (chat_title=? OR custom_name=? OR chat_title=?)", 
+                             (user_id, bot_un, bot_un, bot_un.replace('@', ''))).fetchall()
+        for tc in tc_list:
+            real_chat_id = tc['chat_id']
+            db.execute("DELETE FROM product_messages WHERE message_id IN (SELECT id FROM messages WHERE chat_id=? AND user_id=?)", (real_chat_id, user_id))
+            db.execute("DELETE FROM messages WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
+            db.execute("DELETE FROM excel_configs WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
+            db.execute("DELETE FROM excel_missing_sheets WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
+            db.execute("DELETE FROM tracked_chats WHERE id=?", (tc['id'],))
+            
+    db.execute("DELETE FROM interaction_bots WHERE id=? AND user_id=?", (id, user_id))
     db.commit()
     notify_clients()
     return jsonify({'success': True})
@@ -1075,36 +1137,61 @@ def link_product_folder(prod_id):
     db.commit()
     notify_clients()
     return jsonify({'success': True})
-
 @app.route('/api/products/<int:prod_id>', methods=['PUT'])
 @login_required
 def edit_product(prod_id):
-    data = request.get_json()
     db = get_db()
     
-    syns = data.get('synonyms', [])
-    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()]) if isinstance(syns, list) else (syns or '')
-        
+    # 1. Синонимы (из FormData в JSON)
+    try:
+        syns = json.loads(request.form.get('synonyms', '[]'))
+    except:
+        syns = []
+    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
+
+    # 2. Существующие фото, которые не были удалены
+    try:
+        existing_photos = json.loads(request.form.get('existing_photos', '[]'))
+    except:
+        existing_photos = []
+
+    # 3. Сохраняем новые фото, если они были добавлены
+    files = request.files.getlist('photos')
+    saved_names = []
+    for file in files:
+        if file and file.filename:
+            ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else 'jpg'
+            filename = f"{uuid.uuid4().hex}.{ext}"
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            saved_names.append(filename)
+
+    # 4. Склеиваем старые фото и новые загруженные
+    all_photos = existing_photos + saved_names
+    photo_url_str = ",".join(all_photos)
+
+    # 5. Обновляем товар в базе
     db.execute("""
         UPDATE products 
         SET name=?, synonyms=?, photo_url=?, brand=?, country=?, weight=?, model_number=?, is_on_request=?, folder_id=?
         WHERE id=? AND user_id=?
     """, (
-        data.get('name'), 
+        request.form.get('name'), 
         synonyms_str, 
-        data.get('photo_url'),
-        data.get('brand'),
-        data.get('country'),
-        data.get('weight'),
-        data.get('model_number'),
-        1 if data.get('is_on_request') else 0,
-        data.get('folder_id'), # <--- ВОТ ЭТА СТРОКА СОХРАНИТ ПАПКУ
+        photo_url_str, # Наша новая строка с файлами
+        request.form.get('brand'),
+        request.form.get('country'),
+        request.form.get('weight'),
+        request.form.get('model_number'),
+        1 if request.form.get('is_on_request') == '1' else 0,
+        request.form.get('folder_id'), 
         prod_id, 
         session['user_id']
     ))
     db.commit()
     notify_clients()
     return jsonify({'success': True})
+
+
 
 @app.route('/api/products', methods=['POST'])
 @login_required
@@ -1113,9 +1200,12 @@ def add_product():
     user_id = session['user_id']
     db = get_db()
 
-    # Превращаем массив синонимов в строку для БД
     syns = data.get('synonyms', [])
     synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
+
+    # НОВОЕ: Обработка нескольких ссылок на фото
+    photos = data.get('photo_url', [])
+    photo_url_str = ", ".join([p.strip() for p in photos if p.strip()]) if isinstance(photos, list) else (photos or '')
 
     db.execute("""
         INSERT INTO products 
@@ -1127,7 +1217,7 @@ def add_product():
         synonyms_str, 
         data.get('price', 0), 
         data.get('folder_id'),
-        data.get('photo_url'),
+        photo_url_str, # <--- Заменяем data.get('photo_url') на photo_url_str
         data.get('brand'),
         data.get('country'),
         data.get('weight'),
@@ -1137,6 +1227,7 @@ def add_product():
     db.commit()
     notify_clients()
     return jsonify({'success': True})
+
 
 @app.route('/api/access_tree')
 @login_required
@@ -1379,7 +1470,7 @@ def publish_scheduler():
                 # Берем все активные публикации
                 pubs = db.execute("SELECT * FROM publications WHERE is_active = 1").fetchall()
                 from datetime import timedelta
-                now = datetime.utcnow() + timedelta(hours=3)
+                now = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
                 
                 for pub in pubs:
                     pub_id = pub['id']
@@ -1559,7 +1650,7 @@ def get_catalog_for_client(client_id):
         
     if client['schedule_enabled']:
         from datetime import timedelta # На всякий случай импортируем, если не импортировано
-        now = (datetime.utcnow() + timedelta(hours=3)).time()
+        now = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).time()
         start_time = datetime.strptime(client['time_start'], '%H:%M').time()
         end_time = datetime.strptime(client['time_end'], '%H:%M').time()
         
@@ -1816,7 +1907,7 @@ def google_sheets_scheduler():
                                 chat_title = tc['custom_name'] if tc and tc['custom_name'] else (tc['chat_title'] if tc else str(chat_id))
                                 
                                 from datetime import timedelta
-                                now_str = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+                                now_str = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
                                 msg_type = f"excel_{c_dict['id']}" 
                                 
                                 # Сохраняем сообщение в базу
@@ -2233,30 +2324,52 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                 
                 chat_id = chat.id
                 
-                # --- ЖЕСТКАЯ ИЗОЛЯЦИЯ ПАРСИНГА БОТОВ (ДЛЯ РЕДАКТИРОВАНИЯ) ---
-                if event.is_private:
-                    sender_entity = await event.get_sender()
-                    if getattr(sender_entity, 'bot', False):
-                        bot_un = getattr(sender_entity, 'username', '')
-                        if not bot_un:
-                            try:
-                                entity = await client.get_entity(chat_id)
-                                bot_un = getattr(entity, 'username', '')
-                            except: pass
+              
+                # --- УМНАЯ ИЗОЛЯЦИЯ ПАРСИНГА БОТОВ (ФИНАЛ) ---
+                sender = await event.get_sender()
+                is_bot = getattr(sender, 'bot', False)
+                
+                if is_bot:
+                    bot_un = getattr(sender, 'username', '')
+                    if not bot_un:
+                        try:
+                            entity = await client.get_entity(chat_id)
+                            bot_un = getattr(entity, 'username', '')
+                        except: pass
                         
-                        bot_un_clean = bot_un.lower().replace('@', '') if bot_un else ''
-                        bot_un_at = f"@{bot_un_clean}" if bot_un_clean else ''
+                    bot_un_clean = bot_un.lower().replace('@', '').strip() if bot_un else ''
+                    
+                    # Генерируем все возможные варианты того, как бот мог быть записан в базу
+                    bot_un_at = f"@{bot_un_clean}"
+                    bot_link_1 = f"https://t.me/{bot_un_clean}"
+                    bot_link_2 = f"t.me/{bot_un_clean}"
+                    
+                    print(f"\n[БОТ ДЕБАГ] 🤖 Пришло сообщение от бота: '{bot_un_clean}'. Chat ID: {chat_id}")
+                    
+                    with app.app_context():
+                        local_db = get_db()
+                        # Ищем любое из 4-х совпадений: ник, @ник, t.me/ник или https://t.me/ник
+                        check_bot = local_db.execute(
+                            "SELECT id FROM interaction_bots WHERE user_id = ? AND (LOWER(bot_username) IN (?, ?, ?, ?))",
+                            (user_id, bot_un_clean, bot_un_at, bot_link_1, bot_link_2)
+                        ).fetchone()
                         
-                        with app.app_context():
-                            local_db = get_db()
-                            check_bot = local_db.execute(
-                                "SELECT id FROM interaction_bots WHERE user_id = ? AND userbot_id = ? AND (LOWER(bot_username) IN (?, ?))",
-                                (user_id, session_id, bot_un_clean, bot_un_at)
+                        if not check_bot:
+                            print(f"[БОТ ДЕБАГ] ❌ ОТКАЗ: Бот '{bot_un_clean}' не привязан к аккаунту {user_id}! Игнорируем.")
+                            return
+                        else:
+                            print(f"[БОТ ДЕБАГ] ✅ БОТ ОДОБРЕН: '{bot_un_clean}' найден в базе. Идем дальше...")
+                            
+                            check_tracked = local_db.execute(
+                                "SELECT id FROM tracked_chats WHERE chat_id = ? AND user_id = ?",
+                                (chat_id, user_id)
                             ).fetchone()
                             
-                            if not check_bot:
-                                return # Бот не привязан к этому аккаунту! Игнорируем.
-                # -----------------------------------------------------------------
+                            if not check_tracked:
+                                print(f"[БОТ ДЕБАГ] ❌ ОТКАЗ: Бот одобрен, но не добавлен в источники (tracked_chats)!")
+                            else:
+                                print(f"[БОТ ДЕБАГ] ✅ ПОЛНЫЙ УСПЕХ: Начинаем парсить!")
+                # -------------------------------------------------------------
                 
                 # --- МАГИЯ EXCEL ---
                 parsed_text = await parse_excel_message(client, message, chat_id, user_id)
@@ -2369,11 +2482,15 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                     chat_title = "Unknown"
                     msg_type = 'unknown'
 
-                sender = await event.get_sender()
-                sender_name = f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip() or "Unknown"
+                
 
-                # --- ЖЕСТКАЯ ИЗОЛЯЦИЯ ПАРСИНГА БОТОВ (ДЛЯ НОВЫХ СООБЩЕНИЙ) ---
-                if event.is_private and getattr(sender, 'bot', False):
+                # --- УМНАЯ ИЗОЛЯЦИЯ ПАРСИНГА БОТОВ (ФИНАЛ) ---
+                sender = await event.get_sender()
+                is_bot = getattr(sender, 'bot', False)
+                sender_name = getattr(sender, 'username', '')
+                if not sender_name:
+                    sender_name = getattr(sender, 'first_name', 'Бот')
+                if is_bot:
                     bot_un = getattr(sender, 'username', '')
                     if not bot_un:
                         try:
@@ -2381,18 +2498,38 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                             bot_un = getattr(entity, 'username', '')
                         except: pass
                         
-                    bot_un_clean = bot_un.lower().replace('@', '') if bot_un else ''
-                    bot_un_at = f"@{bot_un_clean}" if bot_un_clean else ''
+                    bot_un_clean = bot_un.lower().replace('@', '').strip() if bot_un else ''
+                    
+                    # Генерируем все возможные варианты того, как бот мог быть записан в базу
+                    bot_un_at = f"@{bot_un_clean}"
+                    bot_link_1 = f"https://t.me/{bot_un_clean}"
+                    bot_link_2 = f"t.me/{bot_un_clean}"
+                    
+                    print(f"\n[БОТ ДЕБАГ] 🤖 Пришло сообщение от бота: '{bot_un_clean}'. Chat ID: {chat_id}")
                     
                     with app.app_context():
                         local_db = get_db()
+                        # Ищем любое из 4-х совпадений: ник, @ник, t.me/ник или https://t.me/ник
                         check_bot = local_db.execute(
-                            "SELECT id FROM interaction_bots WHERE user_id = ? AND userbot_id = ? AND (LOWER(bot_username) IN (?, ?))",
-                            (user_id, session_id, bot_un_clean, bot_un_at)
+                            "SELECT id FROM interaction_bots WHERE user_id = ? AND (LOWER(bot_username) IN (?, ?, ?, ?))",
+                            (user_id, bot_un_clean, bot_un_at, bot_link_1, bot_link_2)
                         ).fetchone()
                         
                         if not check_bot:
-                            return # Бот не привязан к этому аккаунту! Игнорируем.
+                            print(f"[БОТ ДЕБАГ] ❌ ОТКАЗ: Бот '{bot_un_clean}' не привязан к аккаунту {user_id}! Игнорируем.")
+                            return
+                        else:
+                            print(f"[БОТ ДЕБАГ] ✅ БОТ ОДОБРЕН: '{bot_un_clean}' найден в базе. Идем дальше...")
+                            
+                            check_tracked = local_db.execute(
+                                "SELECT id FROM tracked_chats WHERE chat_id = ? AND user_id = ?",
+                                (chat_id, user_id)
+                            ).fetchone()
+                            
+                            if not check_tracked:
+                                print(f"[БОТ ДЕБАГ] ❌ ОТКАЗ: Бот одобрен, но не добавлен в источники (tracked_chats)!")
+                            else:
+                                print(f"[БОТ ДЕБАГ] ✅ ПОЛНЫЙ УСПЕХ: Начинаем парсить!")
                 # -------------------------------------------------------------
 
                 parsed_text = await parse_excel_message(client, message, chat_id, user_id)
@@ -2407,7 +2544,7 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                         # 1. Записываем новое сообщение
               
                         from datetime import timedelta
-                        msg_date = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+                        msg_date = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
                         cursor = db.execute(
                             'INSERT INTO messages (user_id, telegram_message_id, type, text, date, chat_id, chat_title, sender_name, is_delayed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
                             (user_id, message.id, msg_type, parsed_text, msg_date, chat_id, chat_title, sender_name, is_delayed)
@@ -2470,7 +2607,7 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                                     """, (new_msg_id, line_idx, new_price, b['id']))
                         
                         # Б. Умная очистка старых сообщений и неактуальных товаров
-                        cutoff_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+                        cutoff_time = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3) - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
                         
                         # 1. Помечаем товары как неактуальные, если они "застряли" на старом сообщении
                         db.execute("""
@@ -2918,7 +3055,7 @@ def api_parser_scheduler():
                 db = get_db()
                 sources = db.execute("SELECT * FROM api_sources WHERE is_active=1").fetchall()
                 from datetime import timedelta
-                now = datetime.utcnow() + timedelta(hours=3)
+                now = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
                 
                 for src in sources:
                     src_id = src['id']
@@ -3614,13 +3751,15 @@ def delete_tracked_chat(item_id):
         if row:
             real_chat_id = row['chat_id']
             
-            # 2. Удаляем привязки цен к товарам, которые пришли из этого чата
+            # 2. Удаляем привязки цен и сообщения
             db.execute("DELETE FROM product_messages WHERE message_id IN (SELECT id FROM messages WHERE chat_id=? AND user_id=?)", (real_chat_id, user_id))
-            
-            # 3. Удаляем сами спарсенные сообщения из этого чата
             db.execute("DELETE FROM messages WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
             
-        # 4. Удаляем сам чат из списка отслеживаемых (по его внутреннему номеру)
+            # 3. ДОБАВЛЕНО: Полностью сносим старые настройки файлов
+            db.execute("DELETE FROM excel_configs WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
+            db.execute("DELETE FROM excel_missing_sheets WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
+            
+        # 4. Удаляем сам чат
         db.execute("DELETE FROM tracked_chats WHERE id=? AND user_id=?", (item_id, user_id))
         
         db.commit()
@@ -4119,9 +4258,12 @@ TEMPLATE = """
         </div>
     </div>
 
-    <div style="margin-top:15px;">
-        <label style="color:#aaa; font-size:12px;">Ссылка на фото</label>
-        <input type="text" id="p-photo" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
+    <div style="margin-top:20px; border-top:1px solid #444; padding-top:15px;">
+        <label style="color:#4a90e2; font-size:12px; font-weight:bold;">ЗАГРУЗИТЬ ФОТОГРАФИИ</label>
+        
+        <div id="existing-photos" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;"></div>
+        
+        <input type="file" id="p-photos" multiple accept="image/*" style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #555; border-radius:4px;">
     </div>
 
     <div style="margin-top:20px; border-top:1px solid #444; padding-top:15px;">
@@ -4135,11 +4277,7 @@ TEMPLATE = """
             <option value="">Без папки (Общие)</option>
         </select>
     </div>
-    <div style="margin-top:15px;">
-        <label style="color:#ddd; font-size:13px; cursor:pointer; display: flex; align-items: center; gap: 8px;">
-            <input type="checkbox" id="p-request" style="width: 16px; height: 16px;"> Цена по запросу
-        </label>
-    </div>
+    
 
     <div style="margin-top:25px; display:flex; gap:10px;">
         <button onclick="saveProductAction()" style="flex:1; padding:12px; background:#27ae60; border:none; color:white; font-weight:bold; cursor:pointer; border-radius:4px; transition: 0.2s;">СОХРАНИТЬ</button>
@@ -4721,7 +4859,13 @@ function filterProductsByFolder(folderId, folderName) {
             // --- ИСПРАВЛЕНИЕ: Автоматически сбрасываем кэш при любом изменении (POST, PUT, DELETE) ---
             if (options.method && options.method.toUpperCase() !== 'GET') {
                 window.apiCache = {}; 
+            } else {
+                // Для GET запросов добавляем метку времени от кэширования
+                const separator = url.includes('?') ? '&' : '?';
+                url += `${separator}_t=${new Date().getTime()}`;
             }
+            
+            options.cache = 'no-store'; // Жесткий запрет кэша
             // ---------------------------------------------------------------------------------------
 
             const resp = await fetch(url, options);
@@ -5294,6 +5438,23 @@ qrBtn.addEventListener('click', async () => {
         // Подготовка объекта для кнопки редактирования (чтобы не ломать JS кавычками)
         const prodJson = JSON.stringify(p).replace(/"/g, '&quot;');
 
+        // --- НОВОЕ: Обрабатываем ссылки на фото, делаем их кликабельными ---
+        // --- Обрабатываем ссылки на фото для ТАБЛИЦЫ ---
+        let photosHtml = '—';
+        if (p.photo_url) {
+            const urls = p.photo_url.split(',').map(u => u.trim()).filter(u => u);
+            if (urls.length > 0) {
+                photosHtml = urls.map((url, i) => {
+                    // ИСПРАВЛЕНИЕ: Если это просто имя файла, добавляем /uploads/
+                    const validUrl = url.startsWith('http') ? url : `/uploads/${url}`;
+                    
+                    return `<a href="${validUrl}" target="_blank" style="color: #3498db; text-decoration: none; border-bottom: 1px dashed #3498db; margin-right: 5px; display: inline-block; margin-bottom: 4px;" onclick="event.stopPropagation()">Фото ${i+1}</a>`;
+                }).join(' ');
+            }
+        }
+        // ------------------------------------------------
+        // -------------------------------------------------------------------
+
         return `
             <tr style="cursor: pointer; background: ${rowBg}; color: ${textColor}; transition: 0.2s;" 
                 onclick="openProductBinding(${p.id}, '${safeName}')">
@@ -5302,8 +5463,10 @@ qrBtn.addEventListener('click', async () => {
                 <td>${p.model_number || '—'}</td>
                 <td>${p.country || '—'}</td>
                 <td>${p.weight || '—'}</td>
-                <td style="text-align: center;">${p.photo_url ? '🖼️' : '—'}</td>
-                <td style="color: #aaa; font-size: 0.9em;">${p.synonyms || 'нет'}</td>
+                
+                <td style="text-align: left; font-size: 12px; max-width: 150px; flex-wrap: wrap;">${photosHtml}</td>
+                
+                <td style="color: #aaa; font-size: 0.9em; max-width: 200px; overflow: hidden; text-overflow: ellipsis;">${p.synonyms || 'нет'}</td>
                 <td style="white-space: nowrap;" onclick="event.stopPropagation();">
                     <button class="save-btn" onclick='openEditModal(${prodJson})' style="background:#f39c12; margin-right:4px;">✏️</button>
                     <button class="save-btn" onclick="deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
@@ -5315,7 +5478,9 @@ qrBtn.addEventListener('click', async () => {
 
 // ФУНКЦИЯ ОЧИСТКИ ФОРМЫ (Исправлена для новых ID)
 function resetForm() {
-    const fields = ['p-name', 'p-brand', 'p-model', 'p-country', 'p-weight', 'p-photo'];
+currentExistingPhotos = []; 
+renderExistingPhotos()
+    const fields = ['p-name', 'p-brand', 'p-model', 'p-country', 'p-weight'];
     fields.forEach(id => {
         const el = document.getElementById(id);
         if(el) el.value = '';
@@ -5326,7 +5491,11 @@ function resetForm() {
     if (fSelect) {
         fSelect.value = (typeof currentProductFolderView !== 'undefined' && currentProductFolderView !== 'all') ? currentProductFolderView : '';
     }
-
+    const containerPhoto = document.getElementById('photos-list');
+    if(containerPhoto) {
+        containerPhoto.innerHTML = '';
+        addPhotoField(); 
+    }
     const req = document.getElementById('p-request');
     if(req) req.checked = false;
     
@@ -5348,7 +5517,7 @@ function openEditModal(prod) {
     if(document.getElementById('p-model')) document.getElementById('p-model').value = prod.model_number || "";
     if(document.getElementById('p-country')) document.getElementById('p-country').value = prod.country || "";
     if(document.getElementById('p-weight')) document.getElementById('p-weight').value = prod.weight || "";
-    if(document.getElementById('p-photo')) document.getElementById('p-photo').value = prod.photo_url || "";
+
     if(document.getElementById('p-request')) document.getElementById('p-request').checked = (prod.is_on_request === 1);
     if(document.getElementById('p-folder-id')) document.getElementById('p-folder-id').value = prod.folder_id || "";
     const container = document.getElementById('synonyms-list');
@@ -5360,6 +5529,28 @@ function openEditModal(prod) {
             addSynonymField();
         }
     }
+    const containerPhoto = document.getElementById('photos-list');
+    if (containerPhoto) {
+        containerPhoto.innerHTML = ""; // Очищаем старые поля
+        if (prod.photo_url && prod.photo_url.trim() !== "") {
+            // Разрезаем строку из БД по запятой и создаем инпуты
+            prod.photo_url.split(',').forEach(url => {
+                if(url.trim()) addPhotoField(url.trim());
+            });
+        } else {
+            // Если фото нет, добавляем одно пустое поле для удобства
+            addPhotoField();
+        }
+    }
+
+    // --- ЗАГРУЗКА СТАРЫХ ФОТО ---
+    if (prod.photo_url && prod.photo_url.trim() !== "") {
+        currentExistingPhotos = prod.photo_url.split(',').map(s => s.trim()).filter(s => s);
+    } else {
+        currentExistingPhotos = [];
+    }
+    renderExistingPhotos(); // Вызываем отрисовку
+
     document.getElementById('product-modal').style.display = 'block';
 }
 
@@ -5933,9 +6124,12 @@ function loadMessages(page = 1) {
         return;
     } 
 
-    fetch(url) 
+    // Добавляем метку времени, чтобы обмануть кэш браузера
+    let fetchUrl = url + `&_t=${new Date().getTime()}`;
+
+    fetch(fetchUrl, { cache: 'no-store' }) 
         .then(response => response.json()) 
-        .then(data => { 
+        .then(data => {
             if (window.apiCache) window.apiCache[url] = data; 
             renderMessagesData(data); 
         }) 
@@ -7169,7 +7363,11 @@ function escapeHtml(unsafe) {
          .replace(/"/g, "&quot;")
          .replace(/'/g, "&#039;");
 }
-const socket = io();
+// Жестко заставляем использовать только WebSockets (без запасных вариантов)
+const socket = io({ transports: ['polling', 'websocket'] });
+
+// Добавляем проверку подключения
+
 // --- ВОССТАНАВЛИВАЕМ ФУНКЦИЮ ---
 function startPolling() { 
     if (typeof currentView !== 'undefined') { 
@@ -7180,16 +7378,20 @@ function startPolling() {
         }
     } 
 }
-        // -------------------------------
-    // Слушаем событие 'db_updated' от сервера
+    
 
 
-    // ОБЯЗАТЕЛЬНО добавляем эту переменную ПЕРЕД сокетом
+   
 let dbUpdateTimeout = null; 
+
+
 socket.on('db_updated', function(data) { 
+    
+    
     clearTimeout(dbUpdateTimeout); 
     dbUpdateTimeout = setTimeout(() => { 
         window.apiCache = {}; 
+
         
         if (typeof currentView !== 'undefined') { 
             if (document.getElementById('parser-section').style.display === 'block') { 
@@ -7320,7 +7522,6 @@ async function loadTrackedChats() {
         // Интерфейс дерева папок подтянется сам после вызова loadFolders()
     }
 }
-
 
 
 // ================= ЛОГИКА API И КЛИЕНТОВ =================
@@ -8854,6 +9055,36 @@ async function loadPubMarkups(pubId) {
 
 let currentEditingId = null;
 
+let currentExistingPhotos = []; // Массив для хранения старых фото при редактировании
+
+// Функция для отрисовки существующих фото с кнопками "Удалить"
+function renderExistingPhotos() {
+    const containerPhoto = document.getElementById('existing-photos');
+    if (!containerPhoto) return;
+    containerPhoto.innerHTML = "";
+    
+    currentExistingPhotos.forEach((filename, index) => {
+        // Проверяем старая это ссылка или наш файл
+        const fileUrl = filename.startsWith('http') ? filename : `/uploads/${filename}`;
+        
+        const block = document.createElement('div');
+        block.style = "display:inline-block; background:#222; border:1px solid #444; padding:8px; border-radius:4px; text-align:center;";
+        block.innerHTML = `
+            <div style="margin-bottom:5px;">
+                <a href="${fileUrl}" target="_blank" style="color:#3498db; font-size:12px; text-decoration:none; border-bottom:1px dashed #3498db;">Фото ${index + 1}</a>
+            </div>
+            <button type="button" onclick="removeExistingPhoto(${index})" style="background:#e74c3c; color:#fff; border:none; padding:4px 8px; cursor:pointer; font-size:11px; border-radius:3px; width:100%; transition:0.2s;">Удалить</button>
+        `;
+        containerPhoto.appendChild(block);
+    });
+}
+
+// Функция удаления старого фото из массива
+function removeExistingPhoto(index) {
+    currentExistingPhotos.splice(index, 1); // Удаляем из массива
+    renderExistingPhotos(); // Перерисовываем блок
+}
+
 // 1. ФУНКЦИЯ ЗАКРЫТИЯ ОКНА (Кнопка ОТМЕНА)
 function closeProductModal() {
     document.getElementById('product-modal').style.display = 'none';
@@ -8872,7 +9103,22 @@ function addSynonymField(value = "") {
     `;
     container.appendChild(row);
 }
-
+// ДОБАВЛЕНИЕ СТРОКИ С ФОТО
+function addPhotoField(value = "") {
+    const container = document.getElementById('photos-list');
+    if (!container) return; // Защита от ошибок
+    
+    const row = document.createElement('div');
+    row.style = "display:flex; gap:5px; margin-bottom:5px;";
+    row.innerHTML = `
+        <input type="text" class="photo-input" value="${value}" 
+               style="flex:1; padding:5px; background:#111; border:1px solid #444; color:#eee;" 
+               placeholder="https://...">
+        <button type="button" onclick="this.parentElement.remove()" 
+                style="background:none; border:none; color:#e74c3c; cursor:pointer; font-size:18px;">&times;</button>
+    `;
+    container.appendChild(row);
+}
 // 4. ОТКРЫТИЕ ОКНА ДЛЯ НОВОГО ТОВАРА (Кнопка "Добавить товар")
 function openAddModal() {
     currentEditingId = null;
@@ -8886,47 +9132,49 @@ function openAddModal() {
 
 // 6. ОТПРАВКА ДАННЫХ (Кнопка "СОХРАНИТЬ")
 async function saveProductAction() {
+    const formData = new FormData();
+    
+    // 1. Собираем текстовые поля
+    formData.append('name', document.getElementById('p-name').value);
+    formData.append('brand', document.getElementById('p-brand').value);
+    formData.append('model_number', document.getElementById('p-model').value);
+    formData.append('country', document.getElementById('p-country').value);
+    formData.append('weight', document.getElementById('p-weight').value);
+    const requestCheckbox = document.getElementById('p-request');
+    formData.append('is_on_request', (requestCheckbox && requestCheckbox.checked) ? '1' : '0');
+    
+    const folderIdVal = document.getElementById('p-folder-id').value;
+    if (folderIdVal) formData.append('folder_id', folderIdVal);
+
+    // 2. Синонимы упаковываем в строку
     const synInputs = document.querySelectorAll('.synonym-input');
     const synonymsArr = Array.from(synInputs).map(i => i.value.trim()).filter(v => v !== "");
-    const folderIdVal = document.getElementById('p-folder-id').value;
-    // Собираем данные
-    const payload = {
-        name: document.getElementById('p-name').value,
-        brand: document.getElementById('p-brand').value,
-        model_number: document.getElementById('p-model').value,
-        country: document.getElementById('p-country').value,
-        weight: document.getElementById('p-weight').value,
-        photo_url: document.getElementById('p-photo').value,
-        is_on_request: document.getElementById('p-request').checked ? 1 : 0,
-        synonyms: synonymsArr,
-        folder_id: folderIdVal ? parseInt(folderIdVal) : null // <--- ОТПРАВЛЯЕМ ПАПКУ НА СЕРВЕР
-    };
+    formData.append('synonyms', JSON.stringify(synonymsArr));
 
+    // 3. НОВОЕ: Прикрепляем выбранные файлы
+    const fileInput = document.getElementById('p-photos');
+    for (let i = 0; i < fileInput.files.length; i++) {
+        formData.append('photos', fileInput.files[i]);
+    }
+    // --- ПЕРЕДАЕМ ОСТАВШИЕСЯ ФОТО НА СЕРВЕР ---
+    formData.append('existing_photos', JSON.stringify(currentExistingPhotos));
     const url = currentEditingId ? `/api/products/${currentEditingId}` : '/api/products';
     const method = currentEditingId ? 'PUT' : 'POST';
 
-    try {
-        const response = await fetch(url, {
-            method: method,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
+    // ВНИМАНИЕ: При отправке FormData мы НЕ указываем 'Content-Type: application/json'
+    const res = await fetch(url, {
+        method: method,
+        body: formData
+    });
 
-        if (response.ok) {
-            closeProductModal(); // Закрываем окно при успехе
-            
-            // Обновляем таблицу товаров
-            if (typeof loadProducts === 'function') {
-                loadProducts();
-            } else {
-                location.reload(); 
-            }
-        } else {
-            alert("Ошибка при сохранении. Проверьте консоль.");
-        }
-    } catch (error) {
-        console.error("Ошибка запроса:", error);
-        alert("Не удалось связаться с сервером.");
+    if (res.ok) {
+        // Скрываем окно напрямую
+        document.getElementById('product-modal').style.display = 'none';
+        
+        // Перезагружаем список товаров
+        loadProducts();
+    } else {
+        alert('Ошибка при сохранении товара');
     }
 }
 async function savePubMarkup() {
@@ -9269,6 +9517,9 @@ def delete_markup(markup_id):
 # ================= ПУБЛИЧНЫЙ API ДЛЯ ВЫДАЧИ КАТАЛОГА =================
 @app.route('/api/v1/catalog', methods=['GET'])
 def public_api_catalog():
+
+    base_url = "https://engine.astoredirect.ru"
+
     token = request.args.get('token')
     if not token:
         return jsonify({'error': 'Токен не предоставлен'}), 401
@@ -9280,7 +9531,7 @@ def public_api_catalog():
         
     if client['schedule_enabled']:
         from datetime import timedelta
-        now = (datetime.utcnow() + timedelta(hours=3)).time()
+        now = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).time()
         start_time = datetime.strptime(client['time_start'], '%H:%M').time()
         end_time = datetime.strptime(client['time_end'], '%H:%M').time()
         is_active = start_time <= now <= end_time if start_time <= end_time else (now >= start_time or now <= end_time)
@@ -9375,12 +9626,29 @@ def public_api_catalog():
         if rnd > 0:
             final_price = math.ceil(final_price / rnd) * rnd
             
+        domain = "https://engine.astoredirect.ru" 
+        
+        # Формируем полные ссылки на файлы
+        esult = []
+        for p in products:
+            # Превращаем строку "file1.jpg, file2.jpg" в массив полных ссылок
+            photo_links = []
+            if p['photo_url']:
+                filenames = [f.strip() for f in p['photo_url'].split(',') if f.strip()]
+                for name in filenames:
+                    if name.startswith('http'): 
+                        photo_links.append(f"{base_url}/uploads/{name}")
+                    else:
+                        # ВОТ ЗДЕСЬ мы добавляем /uploads/ перед именем файла
+                        photo_links.append(f"{base_url}/uploads/{name}")
+
         products.append({
             'id': p['id'],
             'name': p['name'],
             'category_id': p['folder_id'],
             'price': int(final_price),
-            'photo_url': p['photo_url'],
+            'price2': 'По запросу',
+            "photo_url": photo_links,
             'brand': p['brand'],
             'country': p['country'],
             'weight': p['weight'],
@@ -9833,7 +10101,7 @@ def is_parsing_allowed(session_id):
                 return True 
             
             # Сдвигаем время сервера на +3 часа (Москва).
-            current_time = (datetime.utcnow() + timedelta(hours=3)).time()
+            current_time = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).time()
             
             start_time = datetime.strptime(row['time_start'], '%H:%M').time()
             end_time = datetime.strptime(row['time_end'], '%H:%M').time()
@@ -9915,7 +10183,7 @@ def delayed_messages_scheduler():
                                         """, (msg_id, line_idx, new_price, b['id']))
                             
                             # Очистка старых сообщений (зазор 5 минут)
-                            cutoff_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+                            cutoff_time = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3) - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
                             
                             # 1. Помечаем товары как неактуальные
                             db.execute("""
