@@ -1746,7 +1746,7 @@ def get_catalog_for_client(client_id):
             'id': p['id'],
             'name': p['name'],
             'category_id': p['folder_id'],
-            'price': int(final_price),
+            'price': final_price,
             'photo_url': p['photo_url'],
             'brand': p['brand'],
             'country': p['country'],
@@ -4157,6 +4157,8 @@ TEMPLATE = """
                 <h2>Настройка ботов (Автоматизация)</h2>
                 <div class="card" style="background:#1e1e1e; padding:16px; border-radius:8px; margin-bottom:16px;">
                     <form id="add-interaction-bot-form" style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end;">
+                        <input type="hidden" id="ib_edit_id">
+                        
                         <div class="form-group">
                             <label>Название (для вас)</label>
                             <input type="text" id="ib_custom_name" placeholder="Мой бот 1" required>
@@ -4282,6 +4284,8 @@ TEMPLATE = """
         <label style="color:#4a90e2; font-size:12px; font-weight:bold;">ЗАГРУЗИТЬ ФОТОГРАФИИ</label>
         
         <div id="existing-photos" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;"></div>
+        
+        <div id="new-photos-preview" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;"></div>
         
         <input type="file" id="p-photos" multiple accept="image/*" style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #555; border-radius:4px;">
     </div>
@@ -5498,8 +5502,10 @@ qrBtn.addEventListener('click', async () => {
 
 // ФУНКЦИЯ ОЧИСТКИ ФОРМЫ (Исправлена для новых ID)
 function resetForm() {
-currentExistingPhotos = []; 
-renderExistingPhotos()
+    currentExistingPhotos = []; 
+    renderExistingPhotos()
+    currentNewPhotos = [];
+        if(typeof renderNewPhotos === 'function') renderNewPhotos();
     const fields = ['p-name', 'p-brand', 'p-model', 'p-country', 'p-weight'];
     fields.forEach(id => {
         const el = document.getElementById(id);
@@ -5530,7 +5536,8 @@ renderExistingPhotos()
 function openEditModal(prod) {
     currentEditingId = prod.id;
     document.getElementById('modal-title').innerText = "Редактировать товар";
-    
+    currentNewPhotos = [];
+    if(typeof renderNewPhotos === 'function') renderNewPhotos();
     // Безопасное заполнение полей
     if(document.getElementById('p-name')) document.getElementById('p-name').value = prod.name || "";
     if(document.getElementById('p-brand')) document.getElementById('p-brand').value = prod.brand || "";
@@ -5818,11 +5825,9 @@ function openEditModal(prod) {
 
         // --- Логика Взаимодействия с ботами ---
        async function loadInteractionBots() {
-            // Загружаем список доступных юзерботов
             const bots = await cachedApiFetch('/api/userbots');
             const select = document.getElementById('ib_userbot_id');
             if(select) {
-                // Выводим @username в выпадающем меню
                 select.innerHTML = bots.filter(b => b.status === 'active').map(b => `<option value="${b.id}">${b.account_name || 'API ID: ' + b.api_id}</option>`).join('');
             }
 
@@ -5831,9 +5836,11 @@ function openEditModal(prod) {
             if(!tbody) return;
             
             tbody.innerHTML = ibots.map(ib => {
-                // Ищем юзербота, чтобы показать его имя в таблице
                 const ubot = bots.find(b => b.id === ib.userbot_id);
                 const ubotName = ubot ? (ubot.account_name || ('API ID: ' + ubot.api_id)) : ib.userbot_id;
+                
+                // Подготовка JSON для передачи в кнопку редактирования
+                const ibJson = JSON.stringify(ib).replace(/"/g, '&quot;');
 
                 return `
                 <tr>
@@ -5841,25 +5848,77 @@ function openEditModal(prod) {
                     <td>${ib.bot_username}</td>
                     <td>${JSON.parse(ib.commands).join(', ')}</td>
                     <td>${ib.interval_minutes}</td>
-                    <td><button class="save-btn" onclick="deleteInteractionBot(${ib.id})" style="background:#e74c3c;">Удалить</button></td>
+                    <td style="white-space: nowrap;">
+                        <button type="button" class="save-btn" onclick="editInteractionBot(${ibJson})" style="background:#f39c12; margin-right:4px;">✏️ Ред.</button>
+                        <button type="button" class="save-btn" onclick="deleteInteractionBot(${ib.id})" style="background:#e74c3c;">❌</button>
+                    </td>
                 </tr>
             `}).join('');
         }
 
+        // НОВАЯ ФУНКЦИЯ: Заполнение формы для редактирования
+        window.editInteractionBot = function(bot) {
+            document.getElementById('ib_edit_id').value = bot.id;
+            document.getElementById('ib_custom_name').value = bot.custom_name || '';
+            document.getElementById('ib_userbot_id').value = bot.userbot_id;
+            document.getElementById('ib_bot_username').value = bot.bot_username;
+            
+            let commands = [];
+            try { commands = JSON.parse(bot.commands); } catch(e) {}
+            document.getElementById('ib_commands').value = commands.join(', ');
+            
+            document.getElementById('ib_interval').value = bot.interval_minutes;
+            
+            // Меняем внешний вид кнопки
+            const submitBtn = document.querySelector('#add-interaction-bot-form button[type="submit"]');
+            if (submitBtn) {
+                submitBtn.innerText = '💾 Сохранить изменения';
+                submitBtn.style.background = '#27ae60';
+            }
+            
+            // Плавно прокручиваем к форме
+            document.getElementById('add-interaction-bot-form').scrollIntoView({ behavior: 'smooth' });
+        };
+
+        // ОБНОВЛЕННЫЙ ОБРАБОТЧИК ОТПРАВКИ ФОРМЫ (Умеет и добавлять, и обновлять)
         document.getElementById('add-interaction-bot-form')?.addEventListener('submit', async (e) => {
             e.preventDefault();
+            const editId = document.getElementById('ib_edit_id').value; // Проверяем, редактируем ли мы
             const rawCommands = document.getElementById('ib_commands').value.split(',').map(c => c.trim()).filter(c => c);
-            await apiFetch('/api/interaction_bots', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    userbot_id: parseInt(document.getElementById('ib_userbot_id').value),
-                    bot_username: document.getElementById('ib_bot_username').value,
-                    commands: rawCommands,
-                    interval_minutes: parseInt(document.getElementById('ib_interval').value)
-                })
-            });
+            
+            const payload = {
+                userbot_id: parseInt(document.getElementById('ib_userbot_id').value),
+                bot_username: document.getElementById('ib_bot_username').value,
+                custom_name: document.getElementById('ib_custom_name').value, // Добавил custom_name, которого не было в старом JS
+                commands: rawCommands,
+                interval_minutes: parseInt(document.getElementById('ib_interval').value)
+            };
+
+            if (editId) {
+                // Если есть ID — отправляем PUT-запрос (обновление)
+                await apiFetch(`/api/interaction_bots/${editId}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                // Возвращаем кнопку в исходное состояние
+                const submitBtn = document.querySelector('#add-interaction-bot-form button[type="submit"]');
+                if (submitBtn) {
+                    submitBtn.innerText = 'Добавить';
+                    submitBtn.style.background = '';
+                }
+            } else {
+                // Если ID нет — отправляем POST-запрос (добавление нового)
+                await apiFetch('/api/interaction_bots', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            }
+            
             e.target.reset();
+            document.getElementById('ib_edit_id').value = ''; // Очищаем скрытый ID
             loadInteractionBots();
         });
 
@@ -7864,7 +7923,52 @@ window.toggleApiVisibility = function(targetId, iconEl) {
         if (iconEl) iconEl.innerText = '▶';
     }
 };
+let currentExistingPhotos = []; // Массив для хранения старых фото при редактировании
+let currentNewPhotos = []; // НОВЫЙ МАССИВ: для хранения только что выбранных файлов
 
+// Слушатель событий для выбора новых фото
+document.addEventListener('DOMContentLoaded', () => {
+    const photoInput = document.getElementById('p-photos');
+    if(photoInput) {
+        photoInput.addEventListener('change', function(e) {
+            const files = Array.from(e.target.files);
+            // Добавляем новые файлы в наш массив
+            currentNewPhotos = currentNewPhotos.concat(files);
+            renderNewPhotos();
+            
+            // Очищаем input, чтобы можно было выбрать те же файлы снова (если удалили)
+            this.value = '';
+        });
+    }
+});
+
+// Функция для отрисовки предпросмотра новых файлов
+function renderNewPhotos() {
+    const container = document.getElementById('new-photos-preview');
+    if (!container) return;
+    container.innerHTML = '';
+    
+    currentNewPhotos.forEach((file, index) => {
+        const objectUrl = URL.createObjectURL(file); // Создаем временную ссылку на файл в браузере
+        
+        const block = document.createElement('div');
+        block.style = "display:inline-block; background:#111; border:1px dashed #2ecc71; padding:8px; border-radius:4px; text-align:center; width:80px;";
+        block.innerHTML = `
+            <div style="margin-bottom:5px; height:60px; display:flex; justify-content:center; align-items:center; overflow:hidden;">
+                <img src="${objectUrl}" style="max-width:100%; max-height:100%; border-radius:3px; object-fit:cover;">
+            </div>
+            <div style="font-size:9px; color:#aaa; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-bottom:5px;" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
+            <button type="button" onclick="removeNewPhoto(${index})" style="background:#e74c3c; color:#fff; border:none; padding:4px 8px; cursor:pointer; font-size:11px; border-radius:3px; width:100%; transition:0.2s;">Удалить</button>
+        `;
+        container.appendChild(block);
+    });
+}
+
+// Функция для удаления нового фото из массива до отправки
+window.removeNewPhoto = function(index) {
+    currentNewPhotos.splice(index, 1); // Удаляем файл из массива
+    renderNewPhotos(); // Перерисовываем список
+};
 window.updateParentChecks = function(el) {
     const ul = el.closest('ul');
     if(!ul) return;
@@ -9075,7 +9179,6 @@ async function loadPubMarkups(pubId) {
 
 let currentEditingId = null;
 
-let currentExistingPhotos = []; // Массив для хранения старых фото при редактировании
 
 // Функция для отрисовки существующих фото с кнопками "Удалить"
 function renderExistingPhotos() {
@@ -9172,10 +9275,10 @@ async function saveProductAction() {
     formData.append('synonyms', JSON.stringify(synonymsArr));
 
     // 3. НОВОЕ: Прикрепляем выбранные файлы
-    const fileInput = document.getElementById('p-photos');
-    for (let i = 0; i < fileInput.files.length; i++) {
-        formData.append('photos', fileInput.files[i]);
-    }
+    currentNewPhotos.forEach(file => {
+        formData.append('photos', file);
+    });
+    
     // --- ПЕРЕДАЕМ ОСТАВШИЕСЯ ФОТО НА СЕРВЕР ---
     formData.append('existing_photos', JSON.stringify(currentExistingPhotos));
     const url = currentEditingId ? `/api/products/${currentEditingId}` : '/api/products';
@@ -9377,6 +9480,30 @@ restoreUIState();
 </body>
 </html>
 """
+
+@app.route('/api/interaction_bots/<int:id>', methods=['PUT'])
+@login_required
+def update_interaction_bot(id):
+    data = request.get_json()
+    user_id = session['user_id']
+    db = get_db()
+    
+    bot_username = data.get('bot_username').strip()
+    custom_name = data.get('custom_name')
+    userbot_id = data.get('userbot_id')
+    commands = json.dumps(data.get('commands', []))
+    interval_minutes = data.get('interval_minutes', 60)
+    
+    # Обновляем настройки бота
+    db.execute("""
+        UPDATE interaction_bots 
+        SET userbot_id=?, bot_username=?, custom_name=?, commands=?, interval_minutes=?
+        WHERE id=? AND user_id=?
+    """, (userbot_id, bot_username, custom_name, commands, interval_minutes, id, user_id))
+    
+    db.commit()
+    notify_clients()
+    return jsonify({'success': True})
 
 
 @app.route('/api/fix_db')
@@ -9656,26 +9783,26 @@ def public_api_catalog():
         domain = "https://engine.astoredirect.ru" 
         
         # Формируем полные ссылки на файлы
-        esult = []
-        for p in products:
-            # Превращаем строку "file1.jpg, file2.jpg" в массив полных ссылок
-            photo_links = []
-            if p['photo_url']:
-                filenames = [f.strip() for f in p['photo_url'].split(',') if f.strip()]
-                for name in filenames:
-                    if name.startswith('http'): 
-                        photo_links.append(f"{base_url}/uploads/{name}")
-                    else:
-                        # ВОТ ЗДЕСЬ мы добавляем /uploads/ перед именем файла
-                        photo_links.append(f"{base_url}/uploads/{name}")
+        # --- ОБНОВЛЕННЫЙ БЛОК ---
+        photo_links = []
+        # Проверяем, есть ли вообще фотографии (обращаемся через квадратные скобки)
+        if p['photo_url']:
+            # request.host_url автоматически берет ваш домен (например, https://ваш-домен.ru/)
+            # ВАЖНО: Замените '/static/uploads/' на ту папку, в которой у вас реально лежат картинки!
+            # Если картинки отдаются по адресу site.ru/uploads/..., то оставьте '/uploads/'
+            base_url = request.host_url.rstrip('/') + '/uploads/' 
+            
+            # Разбиваем строку и склеиваем домен с именем файла
+            photo_links = [f"{base_url}{link.strip()}" for link in p['photo_url'].split(',') if link.strip()]
+        # -------------------------------------------------------
 
         products.append({
             'id': p['id'],
             'name': p['name'],
             'category_id': p['folder_id'],
-            'price': int(final_price),
+            'price': final_price, 
             'price2': 'По запросу',
-            "photo_url": photo_links,
+            "photo_url": photo_links,  # <--- Сюда теперь попадут полные ссылки!
             'brand': p['brand'],
             'country': p['country'],
             'weight': p['weight'],
