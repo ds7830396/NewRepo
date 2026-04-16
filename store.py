@@ -569,10 +569,11 @@ def manage_products():
     photo_url_str = ",".join(saved_names) 
 
     # 3. Сохраняем все в базу данных
+    # 3. Сохраняем все в базу данных
     db.execute("""
         INSERT INTO products 
-        (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request, color, storage, ram, warranty, description, specs) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id, 
         request.form.get('name'), 
@@ -580,13 +581,21 @@ def manage_products():
         float(request.form.get('price', 0.0)), 
         folder_id,
         
-        photo_url_str,  # <--- Передаем нашу строку с именами файлов
+        photo_url_str,
         
         request.form.get('brand'),
         request.form.get('country'),
         request.form.get('weight'),
         request.form.get('model_number'),
-        1 if request.form.get('is_on_request') == '1' else 0
+        1 if request.form.get('is_on_request') == '1' else 0,
+        
+        # 🔽 ДОБАВЛЯЕМ ЭТИ СТРОКИ СЮДА 🔽
+        request.form.get('color'),
+        request.form.get('storage'),
+        request.form.get('ram'),
+        request.form.get('warranty'),
+        request.form.get('description'),
+        request.form.get('specs')
     ))
     db.commit()
     notify_clients()
@@ -647,6 +656,7 @@ def get_all_confirmed():
                     'telegram_message_id': row['telegram_message_id'],
                     'type': row['type']
                 }
+
 
     result_raw = []
     has_updates = False 
@@ -926,6 +936,17 @@ def init_db():
             ("products", "weight TEXT DEFAULT NULL"),
             ("products", "model_number TEXT DEFAULT NULL"),
             ("products", "is_on_request INTEGER DEFAULT 0"),
+            ("products", "color TEXT DEFAULT NULL"),
+            ("products", "storage TEXT DEFAULT NULL"),
+            ("products", "ram TEXT DEFAULT NULL"),
+            ("products", "warranty TEXT DEFAULT NULL"),
+           ("products", "color TEXT DEFAULT NULL"),
+            ("products", "storage TEXT DEFAULT NULL"),
+            ("products", "ram TEXT DEFAULT NULL"),
+            ("products", "warranty TEXT DEFAULT NULL"),
+            ("products", "description TEXT DEFAULT NULL"),
+            ("products", "specs TEXT DEFAULT NULL"),
+            ("products", "specs TEXT DEFAULT NULL"),
             ("products", "color TEXT DEFAULT NULL"),
             ("products", "storage TEXT DEFAULT NULL"),
             ("products", "ram TEXT DEFAULT NULL"),
@@ -1665,7 +1686,6 @@ def publish_scheduler():
             time.sleep(60)
 
 
-
 def get_catalog_for_client(client_id):
     """Возвращает каталог для указанного клиента (как в /api/v1/catalog)."""
     db = get_db()
@@ -1674,12 +1694,9 @@ def get_catalog_for_client(client_id):
         return None
 
     user_id = client['user_id']
-    db = get_db()
-    # Получаем клиента (теперь забираем всю строку со всеми настройками)
     
-        
     if client['schedule_enabled']:
-        from datetime import timedelta # На всякий случай импортируем, если не импортировано
+        from datetime import timedelta
         now = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).time()
         start_time = datetime.strptime(client['time_start'], '%H:%M').time()
         end_time = datetime.strptime(client['time_end'], '%H:%M').time()
@@ -1690,7 +1707,6 @@ def get_catalog_for_client(client_id):
     user_id = client['user_id']
     client_id = client['id']
     
-    # Читаем доступы
     allowed_folders = client['allowed_folders'] if 'allowed_folders' in client.keys() else 'all'
     allowed_chats = client['allowed_chats'] if 'allowed_chats' in client.keys() else 'all'
 
@@ -1704,8 +1720,6 @@ def get_catalog_for_client(client_id):
         if m['folder_id'] == 0: default_markup = dict(m)
         else: markups[m['folder_id']] = dict(m)
             
-    # ДОБАВЛЕНО: latest_chat_id (извлекаем чат, из которого была подтверждена последняя цена)
-    
     products_raw = db.execute("""
         SELECT p.id, p.name, p.folder_id, p.price as manual_price, p.photo_url, p.brand, p.country, p.weight, p.model_number, p.is_on_request,
                p.color, p.storage, p.ram, p.warranty, p.description, p.specs,
@@ -1719,31 +1733,24 @@ def get_catalog_for_client(client_id):
     products = []
     active_folder_ids = set()
     
-   # Перед циклом распаковываем JSON
     try:
         access_rules = json.loads(client['access_rules']) if 'access_rules' in client.keys() and client['access_rules'] else {}
     except:
         access_rules = {}
         
     for p in products_raw:
-       
-            
-        # --- ТОЧЕЧНЫЙ ФИЛЬТР ПО ДЕРЕВУ ---
-        if not access_rules: continue # Если клиенту ничего не настроено - отдаем пустой прайс
+        if not access_rules: continue
         
         pid_str = str(p['id'])
-        if pid_str not in access_rules: continue # Товар галочкой не отмечен
+        if pid_str not in access_rules: continue
         
         allowed_chats = access_rules[pid_str]
         chat_id_str = str(p['latest_chat_id'])
         
-        # Если latest_chat_id не пустой, проверяем, разрешен ли этот поставщик
         if chat_id_str != 'None':
             if allowed_chats != ['all'] and chat_id_str not in allowed_chats: 
-                continue # Цена от этого поставщика запрещена
-        # ---------------------------------
+                continue
         
-        # Используем актуальную спарсенную цену или ручную
         base_price = float(p['parsed_price'] if (p['parsed_price'] is not None and p['is_actual'] == 1) else (p['manual_price'] or 0))
         
         if base_price > 0 and not p['is_on_request']:
@@ -1759,27 +1766,18 @@ def get_catalog_for_client(client_id):
             final_price = int(final_price)
         else:
             final_price = "По запросу"
-        
-   
             
-        mk = markups.get(p['folder_id'], default_markup)
-        
-        if mk['markup_type'] == 'percent':
-            final_price = base_price * (1 + mk['markup_value'] / 100)
-        else:
-            final_price = base_price + mk['markup_value']
-            
-        rnd = mk['rounding']
-        if rnd > 0:
-            final_price = math.ceil(final_price / rnd) * rnd
-            
-        # Превращаем строку с фотографиями в массив URL (если они есть)
         photo_list = []
         if p['photo_url']:
-            # Если пути локальные, можно подклеить домен, например: f"http://engine.astoredirect.ru/uploads/{url.strip()}"
-            photo_list = [url.strip() for url in p['photo_url'].split(',') if url.strip()]
+            for url in p['photo_url'].split(','):
+                url = url.strip()
+                if url:
+                    if url.startswith('http'):
+                        photo_list.append(url)
+                    else:
+                        photo_list.append(f"https://engine.astoredirect.ru/static/uploads/{url}")
 
-        # Парсим JSON-характеристики (если они есть)
+        # Единый, правильный парсинг specs
         specs_data = {}
         if p['specs']:
             try:
@@ -1792,15 +1790,15 @@ def get_catalog_for_client(client_id):
             'name': p['name'],
             'category_id': p['folder_id'],
             'price': final_price,
-            'price2': "По запросу" if final_price == "По запросу" else None, # Если нужно выводить
-            'photo_url': photo_list, # Теперь это массив!
+            'price2': "По запросу" if final_price == "По запросу" else None,
+            'photo_url': photo_list, 
             'brand': p['brand'],
             'country': p['country'],
             'weight': p['weight'],
             'model_number': p['model_number'],
             'is_on_request': bool(p['is_on_request']),
             
-            # 🔽 ДОБАВЛЕННЫЕ ПОЛЯ
+            # Все системные поля и объект характеристик
             'color': p['color'],
             'storage': p['storage'],
             'ram': p['ram'],
@@ -1808,11 +1806,12 @@ def get_catalog_for_client(client_id):
             'description': p['description'],
             'specs': specs_data
         })
+        
+        if p['folder_id']:
+            active_folder_ids.add(p['folder_id'])
             
-    # 3. Получаем категории и убираем пустые (Требование 1)
     folders_raw = db.execute("SELECT id, name, parent_id FROM folders WHERE user_id=?", (user_id,)).fetchall()
     
-    # Собираем всех родителей для активных папок, чтобы не сломать дерево
     parent_map = {f['id']: f['parent_id'] for f in folders_raw}
     folders_to_keep = set(active_folder_ids)
     
@@ -1826,10 +1825,9 @@ def get_catalog_for_client(client_id):
                   for f in folders_raw if f['id'] in folders_to_keep]
         
     return {
-    'categories': categories,
-    'products': products
-}
-  
+        'categories': categories,
+        'products': products
+    }
 
 def google_sheets_scheduler():
     """Фоновый поток для парсинга Гугл Таблиц по расписанию с учетом скрытых строк"""
@@ -4302,7 +4300,7 @@ TEMPLATE = """
     </div>
 </div>
 
-<div id="product-modal" style="display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2a2a2a; padding: 25px; border-radius: 8px; z-index: 1000; border: 1px solid #4a90e2; box-shadow: 0 10px 30px rgba(0,0,0,0.7); min-width: 400px; max-height: 90vh; overflow-y: auto;">
+<div id="product-modal" style="display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2a2a2a; padding: 25px; border-radius: 8px; z-index: 1000; border: 1px solid #4a90e2; box-shadow: 0 10px 30px rgba(0,0,0,0.7); min-width: 500px; max-height: 90vh; overflow-y: auto;">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
         <h3 id="modal-title" style="margin: 0; color: #fff; font-size: 20px;">Добавить товар</h3>
         <button onclick="closeProductModal()" style="background: none; border: none; color: #aaa; cursor: pointer; font-size: 18px;">❌</button>
@@ -4331,69 +4329,70 @@ TEMPLATE = """
         </div>
     </div>
 
-    <div style="margin-top:20px; border-top:1px solid #444; padding-top:15px;">
-        <label style="color:#4a90e2; font-size:12px; font-weight:bold;">ЗАГРУЗИТЬ ФОТОГРАФИИ</label>
-        
-        <div id="existing-photos" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;"></div>
-        
-        <div id="new-photos-preview" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;"></div>
-        
-        <input type="file" id="p-photos" multiple accept="image/*" style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #555; border-radius:4px;">
+    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-top:10px;">
+        <div>
+            <label style="color:#aaa; font-size:12px;">Цвет (Color)</label>
+            <input type="text" id="color" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="Например: Silver">
+        </div>
+        <div>
+            <label style="color:#aaa; font-size:12px;">Встр. память</label>
+            <input type="text" id="storage" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="256 GB">
+        </div>
+        <div>
+            <label style="color:#aaa; font-size:12px;">ОЗУ (RAM)</label>
+            <input type="text" id="ram" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="12 GB">
+        </div>
+        <div style="grid-column: span 3;">
+            <label style="color:#aaa; font-size:12px;">Гарантия</label>
+            <input type="text" id="warranty" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="12 месяцев">
+        </div>
+        <div style="grid-column: span 3;">
+            <label style="color:#aaa; font-size:12px;">Описание товара</label>
+            <textarea id="description" rows="2" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="Подробное описание..."></textarea>
+        </div>
+    </div>
+
+    <h6 style="color: #4a90e2; border-bottom: 1px solid #444; padding-bottom: 5px; margin-top: 20px; margin-bottom: 10px; font-size: 14px;">Технические характеристики</h6>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+        <div><label style="color:#aaa; font-size:12px;">Дисплей</label><input type="text" id="spec-display" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder='6.9" OLED'></div>
+        <div><label style="color:#aaa; font-size:12px;">Процессор</label><input type="text" id="spec-processor" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="Apple A19 Pro"></div>
+        <div><label style="color:#aaa; font-size:12px;">Камера</label><input type="text" id="spec-camera" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="48 МП + 48 МП"></div>
+        <div><label style="color:#aaa; font-size:12px;">Фронтальная камера</label><input type="text" id="spec-front-camera" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="18 МП"></div>
+        <div><label style="color:#aaa; font-size:12px;">Видео</label><input type="text" id="spec-video" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="4K, ProRes"></div>
+        <div><label style="color:#aaa; font-size:12px;">Связь</label><input type="text" id="spec-connectivity" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="5G, Wi-Fi 7"></div>
+        <div><label style="color:#aaa; font-size:12px;">Батарея</label><input type="text" id="spec-battery" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="до 20 часов"></div>
+        <div><label style="color:#aaa; font-size:12px;">ОС</label><input type="text" id="spec-os" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="iOS 26"></div>
+        <div><label style="color:#aaa; font-size:12px;">Биометрия</label><input type="text" id="spec-biometrics" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="Face ID"></div>
+        <div><label style="color:#aaa; font-size:12px;">Зарядка</label><input type="text" id="spec-charging" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="MagSafe"></div>
     </div>
 
     <div style="margin-top:20px; border-top:1px solid #444; padding-top:15px;">
+        <label style="color:#4a90e2; font-size:12px; font-weight:bold;">ЗАГРУЗИТЬ ФОТОГРАФИИ</label>
+        <div id="existing-photos" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;"></div>
+        <div id="new-photos-preview" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;"></div>
+        <input type="file" id="p-photos" multiple accept="image/*" style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #555; border-radius:4px;">
+    </div>
+
+    <div style="margin-top:15px; border-top:1px solid #444; padding-top:15px;">
         <label style="color:#4a90e2; font-size:12px; font-weight:bold;">СИНОНИМЫ (Ключевые слова)</label>
         <div id="synonyms-list" style="max-height:150px; overflow-y:auto; margin-bottom:10px;"></div>
         <button type="button" onclick="addSynonymField()" style="width:100%; padding:8px; background:none; border:1px dashed #4a90e2; color:#4a90e2; cursor:pointer; border-radius:4px; transition: 0.2s;">+ Добавить синоним</button>
     </div>
 
-    <div class="form-group mb-3">
-    <label for="color">Цвет (Color)</label>
-    <input type="text" class="form-control" id="color" name="color" placeholder="Например: Space Black">
-</div>
-
-<div class="form-group mb-3">
-    <label for="storage">Встроенная память (Storage)</label>
-    <input type="text" class="form-control" id="storage" name="storage" placeholder="Например: 1 TB">
-</div>
-
-<div class="form-group mb-3">
-    <label for="ram">Оперативная память (RAM)</label>
-    <input type="text" class="form-control" id="ram" name="ram" placeholder="Например: 8 GB">
-</div>
-
-<div class="form-group mb-3">
-    <label for="warranty">Гарантия</label>
-    <input type="text" class="form-control" id="warranty" name="warranty" placeholder="Например: 12 месяцев">
-</div>
-
-<div class="form-group mb-3">
-    <label for="description">Описание товара</label>
-    <textarea class="form-control" id="description" name="description" rows="3" placeholder="Подробное описание..."></textarea>
-</div>
-
-<div class="form-group mb-3">
-    <label for="specs">Характеристики (Specs) в формате JSON</label>
-    <textarea class="form-control" id="specs" name="specs" rows="5" placeholder='{
-  "display": "6.7\" OLED, 120Hz",
-  "processor": "A18 Pro",
-  "camera": "48 MP + 12 MP"
-}'></textarea>
-    <small class="form-text text-muted">Вводите характеристики строго в формате JSON, используя двойные кавычки.</small>
-</div>
     <div style="margin-top:15px;">
         <label style="color:#aaa; font-size:12px;">Папка (Категория)</label>
         <select id="p-folder-id" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
             <option value="">Без папки (Общие)</option>
         </select>
     </div>
-    
 
     <div style="margin-top:25px; display:flex; gap:10px;">
         <button onclick="saveProductAction()" style="flex:1; padding:12px; background:#27ae60; border:none; color:white; font-weight:bold; cursor:pointer; border-radius:4px; transition: 0.2s;">СОХРАНИТЬ</button>
         <button onclick="closeProductModal()" style="padding:12px 20px; background:#c0392b; border:none; color:white; cursor:pointer; border-radius:4px; transition: 0.2s;">ОТМЕНА</button>
     </div>
 </div>
+
+
 
 
 
@@ -5592,12 +5591,22 @@ function resetForm() {
     renderExistingPhotos()
     currentNewPhotos = [];
         if(typeof renderNewPhotos === 'function') renderNewPhotos();
-    const fields = ['p-name', 'p-brand', 'p-model', 'p-country', 'p-weight'];
+    const fields = [
+        'p-name', 'p-brand', 'p-model', 'p-country', 'p-weight', 
+        'color', 'storage', 'ram', 'warranty', 'description',
+        // 🔽 Новые поля характеристик:
+        'spec-display', 'spec-processor', 'spec-camera', 'spec-battery', 'spec-os', 'spec-connectivity'
+    ];
     fields.forEach(id => {
         const el = document.getElementById(id);
         if(el) el.value = '';
     });
-    
+    document.getElementById('color').value = '';
+    document.getElementById('storage').value = '';
+    document.getElementById('ram').value = '';
+    document.getElementById('warranty').value = '';
+    document.getElementById('description').value = '';
+    document.getElementById('specs').value = '';
     // Авто-подстановка текущей открытой папки
     const fSelect = document.getElementById('p-folder-id');
     if (fSelect) {
@@ -5624,45 +5633,59 @@ function openEditModal(prod) {
     document.getElementById('modal-title').innerText = "Редактировать товар";
     currentNewPhotos = [];
     if(typeof renderNewPhotos === 'function') renderNewPhotos();
-    // Безопасное заполнение полей
-    if(document.getElementById('p-name')) document.getElementById('p-name').value = prod.name || "";
-    if(document.getElementById('p-brand')) document.getElementById('p-brand').value = prod.brand || "";
-    if(document.getElementById('p-model')) document.getElementById('p-model').value = prod.model_number || "";
-    if(document.getElementById('p-country')) document.getElementById('p-country').value = prod.country || "";
-    if(document.getElementById('p-weight')) document.getElementById('p-weight').value = prod.weight || "";
+    
+    const setVal = (id, value) => { if(document.getElementById(id)) document.getElementById(id).value = value || ""; };
 
+    // 1. Базовые поля
+    setVal('p-name', prod.name);
+    setVal('p-brand', prod.brand);
+    setVal('p-model', prod.model_number);
+    setVal('p-country', prod.country);
+    setVal('p-weight', prod.weight);
+    setVal('p-folder-id', prod.folder_id);
     if(document.getElementById('p-request')) document.getElementById('p-request').checked = (prod.is_on_request === 1);
-    if(document.getElementById('p-folder-id')) document.getElementById('p-folder-id').value = prod.folder_id || "";
+
+    // 2. Системные поля (5 шт)
+    setVal('color', prod.color);
+    setVal('storage', prod.storage);
+    setVal('ram', prod.ram);
+    setVal('warranty', prod.warranty);
+    setVal('description', prod.description);
+
+    // 3. Распаковка JSON Характеристик (10 шт)
+    let specsObj = {};
+    if (prod.specs) {
+        try {
+            specsObj = typeof prod.specs === 'string' ? JSON.parse(prod.specs) : prod.specs;
+        } catch (e) { console.error("Ошибка чтения specs:", e); }
+    }
+    setVal('spec-display', specsObj.display);
+    setVal('spec-processor', specsObj.processor);
+    setVal('spec-camera', specsObj.camera);
+    setVal('spec-front-camera', specsObj.front_camera);
+    setVal('spec-video', specsObj.video);
+    setVal('spec-connectivity', specsObj.connectivity);
+    setVal('spec-battery', specsObj.battery);
+    setVal('spec-os', specsObj.os);
+    setVal('spec-biometrics', specsObj.biometrics);
+    setVal('spec-charging', specsObj.charging);
+
+    // 4. Синонимы
     const container = document.getElementById('synonyms-list');
     if(container) {
         container.innerHTML = "";
         if (prod.synonyms) {
             prod.synonyms.split(',').forEach(s => addSynonymField(s.trim()));
-        } else {
-            addSynonymField();
-        }
-    }
-    const containerPhoto = document.getElementById('photos-list');
-    if (containerPhoto) {
-        containerPhoto.innerHTML = ""; // Очищаем старые поля
-        if (prod.photo_url && prod.photo_url.trim() !== "") {
-            // Разрезаем строку из БД по запятой и создаем инпуты
-            prod.photo_url.split(',').forEach(url => {
-                if(url.trim()) addPhotoField(url.trim());
-            });
-        } else {
-            // Если фото нет, добавляем одно пустое поле для удобства
-            addPhotoField();
-        }
+        } else { addSynonymField(); }
     }
 
-    // --- ЗАГРУЗКА СТАРЫХ ФОТО ---
+    // 5. Загрузка старых фото
     if (prod.photo_url && prod.photo_url.trim() !== "") {
         currentExistingPhotos = prod.photo_url.split(',').map(s => s.trim()).filter(s => s);
     } else {
         currentExistingPhotos = [];
     }
-    renderExistingPhotos(); // Вызываем отрисовку
+    renderExistingPhotos();
 
     document.getElementById('product-modal').style.display = 'block';
 }
@@ -5671,11 +5694,62 @@ function openEditModal(prod) {
         let currentEditProductId = null;
 
         function editProduct(id, currentName, currentSynonyms) {
-            currentEditProductId = id;
-            document.getElementById('edit-prod-name').value = currentName;
-            document.getElementById('edit-prod-synonyms').value = currentSynonyms;
-            document.getElementById('edit-modal').style.display = 'block';
+    currentEditingId = id; // Говорим системе, что мы редактируем
+    document.getElementById('modal-title').innerText = "Редактировать товар";
+    resetForm();
+
+    // 1. Ищем товар в глобальном массиве allProducts (или prods), чтобы взять все его данные
+    const product = allProducts.find(p => p.id === id);
+    
+    if (product) {
+        // Подставляем старые поля
+        document.getElementById('p-name').value = product.name || '';
+        document.getElementById('p-brand').value = product.brand || '';
+        document.getElementById('p-model').value = product.model_number || '';
+        document.getElementById('p-country').value = product.country || '';
+        document.getElementById('p-weight').value = product.weight || '';
+        
+        if (document.getElementById('p-request')) {
+            document.getElementById('p-request').checked = product.is_on_request === 1 || product.is_on_request === true;
         }
+        document.getElementById('p-folder-id').value = product.folder_id || '';
+
+        // 🔽 ПОДСТАВЛЯЕМ НОВЫЕ ПОЛЯ 🔽
+        document.getElementById('color').value = product.color || '';
+        document.getElementById('storage').value = product.storage || '';
+        document.getElementById('ram').value = product.ram || '';
+        document.getElementById('warranty').value = product.warranty || '';
+        document.getElementById('description').value = product.description || '';
+        
+        // Для JSON поля 'specs' делаем красивое форматирование
+        if (product.specs && typeof product.specs === 'object') {
+            document.getElementById('specs').value = JSON.stringify(product.specs, null, 2);
+        } else {
+            document.getElementById('specs').value = product.specs || '';
+        }
+        // 🔼 КОНЕЦ НОВЫХ ПОЛЕЙ 🔼
+        
+        // Восстановление фотографий
+        currentExistingPhotos = [];
+        if (product.photo_url) {
+            currentExistingPhotos = Array.isArray(product.photo_url) 
+                ? product.photo_url 
+                : product.photo_url.split(',').filter(url => url.trim());
+        }
+        renderExistingPhotos();
+        
+        // Восстановление синонимов
+        const synonymsList = document.getElementById('synonyms-list');
+        synonymsList.innerHTML = '';
+        if (product.synonyms) {
+            product.synonyms.split(',').forEach(syn => addSynonymField(syn.trim()));
+        } else if (currentSynonyms) {
+             currentSynonyms.split(',').forEach(syn => addSynonymField(syn.trim()));
+        }
+    }
+
+    document.getElementById('product-modal').style.display = 'block';
+}
 
  async function saveEditProduct() {
             if (!currentEditProductId) return;
@@ -9343,51 +9417,81 @@ function openAddModal() {
 async function saveProductAction() {
     const formData = new FormData();
     
-    // 1. Собираем текстовые поля
-    formData.append('name', document.getElementById('p-name').value);
-    formData.append('brand', document.getElementById('p-brand').value);
-    formData.append('model_number', document.getElementById('p-model').value);
-    formData.append('country', document.getElementById('p-country').value);
-    formData.append('weight', document.getElementById('p-weight').value);
+    // Безопасная функция для получения значений
+    const getVal = (id) => {
+        const el = document.getElementById(id);
+        return el ? el.value.trim() : "";
+    };
+
+    // 1. Базовые текстовые поля
+    formData.append('name', getVal('p-name'));
+    formData.append('brand', getVal('p-brand'));
+    formData.append('model_number', getVal('p-model'));
+    formData.append('country', getVal('p-country'));
+    formData.append('weight', getVal('p-weight'));
+    
     const requestCheckbox = document.getElementById('p-request');
     formData.append('is_on_request', (requestCheckbox && requestCheckbox.checked) ? '1' : '0');
     
-    const folderIdVal = document.getElementById('p-folder-id').value;
+    const folderIdVal = getVal('p-folder-id');
     if (folderIdVal) formData.append('folder_id', folderIdVal);
 
-    // 2. Синонимы упаковываем в строку
+    // 2. Дополнительные системные поля (5 шт)
+    formData.append('color', getVal('color'));
+    formData.append('storage', getVal('storage'));
+    formData.append('ram', getVal('ram'));
+    formData.append('warranty', getVal('warranty'));
+    formData.append('description', getVal('description'));
+
+    // 3. Характеристики Specs (10 шт) - Собираем в JSON
+    const specsObj = {
+        display: getVal('spec-display'),
+        processor: getVal('spec-processor'),
+        camera: getVal('spec-camera'),
+        front_camera: getVal('spec-front-camera'),
+        video: getVal('spec-video'),
+        connectivity: getVal('spec-connectivity'),
+        battery: getVal('spec-battery'),
+        os: getVal('spec-os'),
+        biometrics: getVal('spec-biometrics'),
+        charging: getVal('spec-charging')
+    };
+    
+    // Удаляем пустые свойства, чтобы JSON был чистым
+    const cleanSpecs = Object.fromEntries(Object.entries(specsObj).filter(([_, v]) => v !== ""));
+    formData.append('specs', Object.keys(cleanSpecs).length > 0 ? JSON.stringify(cleanSpecs) : "");
+
+    // 4. Синонимы
     const synInputs = document.querySelectorAll('.synonym-input');
     const synonymsArr = Array.from(synInputs).map(i => i.value.trim()).filter(v => v !== "");
     formData.append('synonyms', JSON.stringify(synonymsArr));
 
-    // 3. НОВОЕ: Прикрепляем выбранные файлы
+    // 5. Фотографии
     currentNewPhotos.forEach(file => {
         formData.append('photos', file);
     });
-    
-    // --- ПЕРЕДАЕМ ОСТАВШИЕСЯ ФОТО НА СЕРВЕР ---
     formData.append('existing_photos', JSON.stringify(currentExistingPhotos));
+    
+    // 6. Отправка
     const url = currentEditingId ? `/api/products/${currentEditingId}` : '/api/products';
     const method = currentEditingId ? 'PUT' : 'POST';
 
-    // ВНИМАНИЕ: При отправке FormData мы НЕ указываем 'Content-Type: application/json'
     const res = await fetch(url, {
         method: method,
         body: formData
     });
 
     if (res.ok) {
-        // Скрываем окно напрямую
         document.getElementById('product-modal').style.display = 'none';
-        
-        // Перезагружаем список товаров
         loadProducts();
-        document.getElementById('p-photos').value = '';
+        if (document.getElementById('p-photos')) document.getElementById('p-photos').value = '';
     } else {
         alert('Ошибка при сохранении товара');
-        document.getElementById('p-photos').value = '';
+        if (document.getElementById('p-photos')) document.getElementById('p-photos').value = '';
     }
 }
+
+
 async function savePubMarkup() {
     const pubId = document.getElementById('pub_id').value;
 
@@ -9752,9 +9856,6 @@ def delete_markup(markup_id):
 # ================= ПУБЛИЧНЫЙ API ДЛЯ ВЫДАЧИ КАТАЛОГА =================
 @app.route('/api/v1/catalog', methods=['GET'])
 def public_api_catalog():
-
-    base_url = "https://engine.astoredirect.ru"
-
     token = request.args.get('token')
     if not token:
         return jsonify({'error': 'Токен не предоставлен'}), 401
@@ -9764,11 +9865,14 @@ def public_api_catalog():
     if not client:
         return jsonify({'error': 'Неверный токен'}), 401
         
+    # --- ПРОВЕРКА РАСПИСАНИЯ ---
     if client['schedule_enabled']:
         from datetime import timedelta
+        # МСК время (UTC+3)
         now = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).time()
         start_time = datetime.strptime(client['time_start'], '%H:%M').time()
         end_time = datetime.strptime(client['time_end'], '%H:%M').time()
+        
         is_active = start_time <= now <= end_time if start_time <= end_time else (now >= start_time or now <= end_time)
         if not is_active: 
             return jsonify({'categories': [], 'products': []})
@@ -9776,6 +9880,7 @@ def public_api_catalog():
     user_id = client['user_id']
     client_id = client['id']
 
+    # --- ПОЛУЧАЕМ НАЦЕНКИ ---
     markups_raw = db.execute("SELECT folder_id, markup_type, markup_value, rounding FROM api_markups WHERE client_id=?", (client_id,)).fetchall()
     markups = {}
     default_markup = {'markup_type': 'percent', 'markup_value': 0, 'rounding': 100}
@@ -9785,72 +9890,56 @@ def public_api_catalog():
         else: 
             markups[m['folder_id']] = dict(m)
 
-    # 1. Получаем базовую информацию обо всех товарах
-
-    products_raw = db.execute("SELECT id, name, folder_id, price as manual_price, photo_url, brand, country, weight, model_number, is_on_request FROM products WHERE user_id = ?", (user_id,)).fetchall()
-    
-    # 2. Получаем ВСЕ актуальные цены, чтобы потом отфильтровать их по нужным поставщикам
-    prices_raw = db.execute("""
-        SELECT pm.product_id, pm.extracted_price, m.chat_id, m.date
-        FROM product_messages pm
-        JOIN messages m ON pm.message_id = m.id
-        WHERE pm.status = 'confirmed' AND pm.is_actual = 1 AND m.user_id = ?
-        ORDER BY m.date DESC
+    # --- ПОЛУЧАЕМ ТОВАРЫ (С ПОЛНЫМ НАБОРОМ ПОЛЕЙ И ЦЕНАМИ) ---
+    # Используем подзапросы, чтобы сразу вытащить последнюю подтвержденную цену
+    products_raw = db.execute("""
+        SELECT p.id, p.name, p.folder_id, p.price as manual_price, p.photo_url, p.brand, p.country, p.weight, p.model_number, p.is_on_request,
+               p.color, p.storage, p.ram, p.warranty, p.description, p.specs,
+               (SELECT pm.extracted_price FROM product_messages pm JOIN messages m ON pm.message_id = m.id 
+                WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as parsed_price,
+               (SELECT pm.is_actual FROM product_messages pm JOIN messages m ON pm.message_id = m.id 
+                WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as is_actual,
+               (SELECT m.chat_id FROM product_messages pm JOIN messages m ON pm.message_id = m.id 
+                WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as latest_chat_id
+        FROM products p
+        WHERE p.user_id = ?
     """, (user_id,)).fetchall()
     
-    product_prices = {}
-    for pr in prices_raw:
-        pid = pr['product_id']
-        if pid not in product_prices:
-            product_prices[pid] = []
-        product_prices[pid].append(pr)
-
     products = []
     active_folder_ids = set()
     
+    # Правила доступа (какие товары и каких поставщиков видит этот клиент)
     try:
         access_rules = json.loads(client['access_rules']) if 'access_rules' in client.keys() and client['access_rules'] else {}
     except:
         access_rules = {}
 
     for p in products_raw:
-        if not access_rules: 
-            continue # Если клиенту ничего не настроено - отдаем пустой прайс
-            
+        # 1. Фильтр доступа: если товар не отмечен в access_rules - пропускаем
         pid_str = str(p['id'])
-        if pid_str not in access_rules: 
-            continue # Товар галочкой не отмечен
+        if not access_rules or pid_str not in access_rules: 
+            continue
             
+        # 2. Фильтр поставщиков (чатов)
         allowed_chats = access_rules[pid_str]
-        prices = product_prices.get(p['id'], [])
-        best_price = None
-
-        if allowed_chats == 'all' or allowed_chats == ['all']:
-            if prices:
-                best_price = prices[0]['extracted_price']
-        else:
-            if isinstance(allowed_chats, str):
-                allowed_chats = [allowed_chats]
-                
-            # Ищем самую свежую цену строго от РАЗРЕШЕННОГО поставщика
-            for pr in prices:
-                chat_id_str = str(pr['chat_id'])
-                is_allowed = False
-                for ac in allowed_chats:
-                    ac_str = str(ac)
-                    if chat_id_str == ac_str or chat_id_str == f"api_src_{ac_str}" or ac_str == f"api_src_{chat_id_str}":
-                        is_allowed = True
-                        break
-                if is_allowed:
-                    best_price = pr['extracted_price']
-                    break # Нашли правильную цену!
-
-        # Устанавливаем базовую цену
-        base_price = float(best_price if best_price is not None else (p['manual_price'] or 0))
+        chat_id_str = str(p['latest_chat_id'])
         
-        # НОВАЯ ЛОГИКА ЦЕНЫ (вместо пропуска товара)
+        # Если есть цена от конкретного чата, проверяем, разрешен ли он (или разрешены 'all')
+        if chat_id_str != 'None':
+            if allowed_chats != ['all'] and chat_id_str not in allowed_chats:
+                # Цена от этого поставщика запрещена, но мы можем использовать ручную цену p['manual_price']
+                # Если ручной цены нет, товар станет "По запросу"
+                current_price_source = None 
+            else:
+                current_price_source = p['parsed_price'] if p['is_actual'] == 1 else None
+        else:
+            current_price_source = None
+
+        # 3. Расчет базовой цены
+        base_price = float(current_price_source if current_price_source is not None else (p['manual_price'] or 0))
+        
+        # 4. Применение наценок и округления
         if base_price > 0 and not p['is_on_request']:
-            # Цена есть и товар не "по запросу" - считаем наценку
             mk = markups.get(p['folder_id'], default_markup)
             if mk['markup_type'] == 'percent':
                 final_price = base_price * (1 + mk['markup_value'] / 100)
@@ -9860,63 +9949,75 @@ def public_api_catalog():
             rnd = mk['rounding']
             if rnd > 0:
                 final_price = math.ceil(final_price / rnd) * rnd
-                
-            final_price = int(final_price) # Отдаем числом
+            final_price = int(final_price)
         else:
-            # Цены нет у поставщиков ИЛИ стоит ручная галочка "По запросу"
             final_price = "По запросу"
 
-        domain = "https://engine.astoredirect.ru" 
-        
-        # Формируем полные ссылки на файлы
-        # --- ОБНОВЛЕННЫЙ БЛОК ---
+        # 5. Обработка фотографий (формируем полные ссылки)
         photo_links = []
-        # Проверяем, есть ли вообще фотографии (обращаемся через квадратные скобки)
         if p['photo_url']:
-            # request.host_url автоматически берет ваш домен (например, https://ваш-домен.ru/)
-            # ВАЖНО: Замените '/static/uploads/' на ту папку, в которой у вас реально лежат картинки!
-            # Если картинки отдаются по адресу site.ru/uploads/..., то оставьте '/uploads/'
-            base_url = request.host_url.rstrip('/') + '/uploads/' 
-            
-            # Разбиваем строку и склеиваем домен с именем файла
-            photo_links = [f"{base_url}{link.strip()}" for link in p['photo_url'].split(',') if link.strip()]
-        # -------------------------------------------------------
+            # Базовый URL вашего сервера
+            base_img_url = "https://engine.astoredirect.ru/static/uploads/"
+            photo_links = [
+                (f"{base_img_url}{link.strip()}" if not link.strip().startswith('http') else link.strip())
+                for link in p['photo_url'].split(',') if link.strip()
+            ]
 
+        # 6. Обработка технических характеристик (specs)
+        specs_data = {}
+        if p['specs']:
+            try:
+                specs_data = json.loads(p['specs'])
+            except:
+                specs_data = {}
+
+        # 7. Формируем финальный объект товара
         products.append({
             'id': p['id'],
             'name': p['name'],
             'category_id': p['folder_id'],
             'price': final_price, 
-            'price2': 'По запросу',
-            "photo_url": photo_links,  # <--- Сюда теперь попадут полные ссылки!
+            'price2': "По запросу" if final_price == "По запросу" else None,
+            "photo_url": photo_links,
             'brand': p['brand'],
             'country': p['country'],
             'weight': p['weight'],
             'model_number': p['model_number'],
-            'is_on_request': bool(p['is_on_request'])
+            'is_on_request': bool(p['is_on_request']),
+            
+            # Новые поля
+            'color': p['color'],
+            'storage': p['storage'],
+            'ram': p['ram'],
+            'warranty': p['warranty'],
+            'description': p['description'],
+            'specs': specs_data
         })
         
+        # Запоминаем ID папки, чтобы потом показать её в списке категорий
         if p['folder_id']:
             active_folder_ids.add(p['folder_id'])
 
-    # Получаем категории
+    # --- ОБРАБОТКА КАТЕГОРИЙ (только те, в которых есть товары) ---
     folders_raw = db.execute("SELECT id, name, parent_id FROM folders WHERE user_id=?", (user_id,)).fetchall()
     parent_map = {f['id']: f['parent_id'] for f in folders_raw}
     folders_to_keep = set(active_folder_ids)
     
+    # Добавляем всех родителей активных папок (чтобы дерево не рассыпалось)
     for fid in active_folder_ids:
         current = fid
         while current in parent_map and parent_map[current] is not None:
             current = parent_map[current]
             folders_to_keep.add(current)
             
-    categories = [{'id': f['id'], 'name': f['name'], 'parent_id': f['parent_id']} 
-                  for f in folders_raw if f['id'] in folders_to_keep]
+    categories = [
+        {'id': f['id'], 'name': f['name'], 'parent_id': f['parent_id']} 
+        for f in folders_raw if f['id'] in folders_to_keep
+    ]
                   
-    # --- СОРТИРОВКА ТОВАРОВ И КАТЕГОРИЙ ПО ИМЕНИ (А-Я) ---
+    # --- СОРТИРОВКА (А-Я) ---
     products.sort(key=lambda x: (x['name'] or '').lower())
     categories.sort(key=lambda x: (x['name'] or '').lower())
-    # -----------------------------------------------------
         
     return jsonify({
         'categories': categories,
