@@ -926,7 +926,12 @@ def init_db():
             ("products", "weight TEXT DEFAULT NULL"),
             ("products", "model_number TEXT DEFAULT NULL"),
             ("products", "is_on_request INTEGER DEFAULT 0"),
-            
+            ("products", "color TEXT DEFAULT NULL"),
+            ("products", "storage TEXT DEFAULT NULL"),
+            ("products", "ram TEXT DEFAULT NULL"),
+            ("products", "warranty TEXT DEFAULT NULL"),
+            ("products", "description TEXT DEFAULT NULL"),
+            ("products", "specs TEXT DEFAULT NULL"),
             ("product_messages", "line_index INTEGER DEFAULT -1"),
             ("product_messages", "group_id INTEGER"),
             ("product_messages", "line_index INTEGER DEFAULT -1"),
@@ -1137,6 +1142,8 @@ def link_product_folder(prod_id):
     db.commit()
     notify_clients()
     return jsonify({'success': True})
+
+
 @app.route('/api/products/<int:prod_id>', methods=['PUT'])
 @login_required
 def edit_product(prod_id):
@@ -1172,18 +1179,28 @@ def edit_product(prod_id):
     # 5. Обновляем товар в базе
     db.execute("""
         UPDATE products 
-        SET name=?, synonyms=?, photo_url=?, brand=?, country=?, weight=?, model_number=?, is_on_request=?, folder_id=?
+        SET name=?, synonyms=?, photo_url=?, brand=?, country=?, weight=?, model_number=?, is_on_request=?, folder_id=?,
+            color=?, storage=?, ram=?, warranty=?, description=?, specs=?
         WHERE id=? AND user_id=?
     """, (
         request.form.get('name'), 
         synonyms_str, 
-        photo_url_str, # Наша новая строка с файлами
+        photo_url_str, 
         request.form.get('brand'),
         request.form.get('country'),
         request.form.get('weight'),
         request.form.get('model_number'),
         1 if request.form.get('is_on_request') == '1' else 0,
         request.form.get('folder_id'), 
+        
+        # 🔽 ДОБАВЛЯЕМ ПРИЕМ ПОЛЕЙ
+        request.form.get('color'),
+        request.form.get('storage'),
+        request.form.get('ram'),
+        request.form.get('warranty'),
+        request.form.get('description'),
+        request.form.get('specs'), # Предполагается, что с фронта specs придет как JSON-строка
+
         prod_id, 
         session['user_id']
     ))
@@ -1207,22 +1224,35 @@ def add_product():
     photos = data.get('photo_url', [])
     photo_url_str = ", ".join([p.strip() for p in photos if p.strip()]) if isinstance(photos, list) else (photos or '')
 
+    # Парсинг specs в строку для БД
+    specs_json = None
+    if data.get('specs'):
+        specs_json = json.dumps(data.get('specs'))
+
     db.execute("""
         INSERT INTO products 
-        (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request, color, storage, ram, warranty, description, specs) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id, 
         data.get('name'), 
         synonyms_str, 
         data.get('price', 0), 
         data.get('folder_id'),
-        photo_url_str, # <--- Заменяем data.get('photo_url') на photo_url_str
+        photo_url_str,
         data.get('brand'),
         data.get('country'),
         data.get('weight'),
         data.get('model_number'),
-        1 if data.get('is_on_request') else 0
+        1 if data.get('is_on_request') else 0,
+        
+        # 🔽 НОВЫЕ ПОЛЯ
+        data.get('color'),
+        data.get('storage'),
+        data.get('ram'),
+        data.get('warranty'),
+        data.get('description'),
+        specs_json
     ))
     db.commit()
     notify_clients()
@@ -1678,6 +1708,7 @@ def get_catalog_for_client(client_id):
     
     products_raw = db.execute("""
         SELECT p.id, p.name, p.folder_id, p.price as manual_price, p.photo_url, p.brand, p.country, p.weight, p.model_number, p.is_on_request,
+               p.color, p.storage, p.ram, p.warranty, p.description, p.specs,
                (SELECT pm.extracted_price FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as parsed_price,
                (SELECT pm.is_actual FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as is_actual,
                (SELECT m.chat_id FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as latest_chat_id
@@ -1742,21 +1773,41 @@ def get_catalog_for_client(client_id):
         if rnd > 0:
             final_price = math.ceil(final_price / rnd) * rnd
             
+        # Превращаем строку с фотографиями в массив URL (если они есть)
+        photo_list = []
+        if p['photo_url']:
+            # Если пути локальные, можно подклеить домен, например: f"http://engine.astoredirect.ru/uploads/{url.strip()}"
+            photo_list = [url.strip() for url in p['photo_url'].split(',') if url.strip()]
+
+        # Парсим JSON-характеристики (если они есть)
+        specs_data = {}
+        if p['specs']:
+            try:
+                specs_data = json.loads(p['specs'])
+            except Exception:
+                pass
+
         products.append({
             'id': p['id'],
             'name': p['name'],
             'category_id': p['folder_id'],
             'price': final_price,
-            'photo_url': p['photo_url'],
+            'price2': "По запросу" if final_price == "По запросу" else None, # Если нужно выводить
+            'photo_url': photo_list, # Теперь это массив!
             'brand': p['brand'],
             'country': p['country'],
             'weight': p['weight'],
             'model_number': p['model_number'],
-            'is_on_request': bool(p['is_on_request'])
+            'is_on_request': bool(p['is_on_request']),
+            
+            # 🔽 ДОБАВЛЕННЫЕ ПОЛЯ
+            'color': p['color'],
+            'storage': p['storage'],
+            'ram': p['ram'],
+            'warranty': p['warranty'],
+            'description': p['description'],
+            'specs': specs_data
         })
-        
-        if p['folder_id']:
-            active_folder_ids.add(p['folder_id'])
             
     # 3. Получаем категории и убираем пустые (Требование 1)
     folders_raw = db.execute("SELECT id, name, parent_id FROM folders WHERE user_id=?", (user_id,)).fetchall()
@@ -4295,6 +4346,41 @@ TEMPLATE = """
         <div id="synonyms-list" style="max-height:150px; overflow-y:auto; margin-bottom:10px;"></div>
         <button type="button" onclick="addSynonymField()" style="width:100%; padding:8px; background:none; border:1px dashed #4a90e2; color:#4a90e2; cursor:pointer; border-radius:4px; transition: 0.2s;">+ Добавить синоним</button>
     </div>
+
+    <div class="form-group mb-3">
+    <label for="color">Цвет (Color)</label>
+    <input type="text" class="form-control" id="color" name="color" placeholder="Например: Space Black">
+</div>
+
+<div class="form-group mb-3">
+    <label for="storage">Встроенная память (Storage)</label>
+    <input type="text" class="form-control" id="storage" name="storage" placeholder="Например: 1 TB">
+</div>
+
+<div class="form-group mb-3">
+    <label for="ram">Оперативная память (RAM)</label>
+    <input type="text" class="form-control" id="ram" name="ram" placeholder="Например: 8 GB">
+</div>
+
+<div class="form-group mb-3">
+    <label for="warranty">Гарантия</label>
+    <input type="text" class="form-control" id="warranty" name="warranty" placeholder="Например: 12 месяцев">
+</div>
+
+<div class="form-group mb-3">
+    <label for="description">Описание товара</label>
+    <textarea class="form-control" id="description" name="description" rows="3" placeholder="Подробное описание..."></textarea>
+</div>
+
+<div class="form-group mb-3">
+    <label for="specs">Характеристики (Specs) в формате JSON</label>
+    <textarea class="form-control" id="specs" name="specs" rows="5" placeholder='{
+  "display": "6.7\" OLED, 120Hz",
+  "processor": "A18 Pro",
+  "camera": "48 MP + 12 MP"
+}'></textarea>
+    <small class="form-text text-muted">Вводите характеристики строго в формате JSON, используя двойные кавычки.</small>
+</div>
     <div style="margin-top:15px;">
         <label style="color:#aaa; font-size:12px;">Папка (Категория)</label>
         <select id="p-folder-id" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
