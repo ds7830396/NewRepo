@@ -1775,7 +1775,7 @@ def get_catalog_for_client(client_id):
                     if url.startswith('http'):
                         photo_list.append(url)
                     else:
-                        photo_list.append(f"https://engine.astoredirect.ru/static/uploads/{url}")
+                        photo_list.append(f"https://engine.astoredirect.ru/uploads/{url}")
 
         # Единый, правильный парсинг specs
         specs_data = {}
@@ -1790,7 +1790,7 @@ def get_catalog_for_client(client_id):
             'name': p['name'],
             'category_id': p['folder_id'],
             'price': final_price,
-            'price2': "По запросу" if final_price == "По запросу" else None,
+            'price2': "По запросу" ,
             'photo_url': photo_list, 
             'brand': p['brand'],
             'country': p['country'],
@@ -3401,15 +3401,62 @@ def toggle_publication(pub_id):
     notify_clients()
     return jsonify({'success': True})
 
+import re
+
+
+def smart_folder_sort_key(folder):
+    """
+    Умная сортировка:
+    1. 'По умолчанию' всегда сверху.
+    2. Обычные папки идут по алфавиту.
+    3. Папки с гигабайтами и терабайтами идут в конце и сортируются по объему.
+    """
+    name = folder.get('name', '').strip()
+    name_lower = name.lower()
+    
+    # Папка "По умолчанию" всегда будет самой первой (-1)
+    if name_lower == 'по умолчанию':
+        return (-1, 0, name)
+        
+    # Ищем названия, состоящие из цифр (64, 128) и опционально "гб" или "тб"
+    match = re.fullmatch(r'(\d+)\s*(тб|tb|гб|gb)?', name_lower)
+    
+    if match:
+        val = int(match.group(1))
+        unit = match.group(2)
+        
+        # Переводим терабайты в гигабайты (1 ТБ = 1024 ГБ) для правильной последовательности
+        if unit in ['тб', 'tb']:
+            val *= 1024
+            
+        # (1, ...) отправляет такие папки в конец списка, затем сортирует по числу
+        return (1, val, name)
+        
+    # (0, ...) оставляет обычные папки в начале списка и сортирует по алфавиту
+    return (0, 0, name)
+
+def sort_folders_recursive(folders_list):
+    """Рекурсивно сортирует каждую папку и её подпапки"""
+    folders_list.sort(key=smart_folder_sort_key)
+    for f in folders_list:
+        if f.get('children'):
+            sort_folders_recursive(f['children'])
+
+
 @app.route('/api/folders/tree')
 @login_required
 def get_folder_tree():
     user_id = session['user_id']
     db = get_db()
-    cursor = db.execute("SELECT id, name, parent_id FROM folders WHERE user_id = ? ORDER BY parent_id, name", (user_id,))
+    
+    # Извлекаем все папки из БД
+    cursor = db.execute("SELECT id, name, parent_id FROM folders WHERE user_id = ?", (user_id,))
     rows = cursor.fetchall()
+    
     folders = {}
     roots = []
+    
+    # 1. Заполняем словарь всеми папками
     for row in rows:
         folders[row['id']] = {
             'id': row['id'],
@@ -3417,12 +3464,18 @@ def get_folder_tree():
             'parent_id': row['parent_id'],
             'children': []
         }
+        
+    # 2. Выстраиваем дерево (кто в какой папке лежит)
     for fid, f in folders.items():
         if f['parent_id'] is None:
             roots.append(f)
         else:
             if f['parent_id'] in folders:
                 folders[f['parent_id']]['children'].append(f)
+                
+    # 3. Применяем умную сортировку ко всему дереву перед отправкой на фронтенд
+    sort_folders_recursive(roots)
+                
     return jsonify(roots)
 
 @app.route('/api/folders', methods=['POST'])
@@ -7909,13 +7962,11 @@ async function savePublishSettings(clientId) {
 }
 
 
-
 async function openMarkups(clientId, clientName) {
-    // 1. Показываем наценки (оригинальный код без изменений)
+    // 1. Показываем наценки
     document.getElementById('api-markups-container').style.display = 'block';
     document.getElementById('markup-client-title').innerHTML = `Настройка наценок: <span style="color:#fff;">${clientName}</span>`;
     document.getElementById('markup-client-id').value = clientId;
-    
 
     const folders = await cachedApiFetch('/api/folders/tree');
     const select = document.getElementById('markup-folder');
@@ -7935,21 +7986,17 @@ async function openMarkups(clientId, clientName) {
     document.getElementById('filters-client-title').innerHTML = `Доступ: <span style="color:#fff;">${clientName}</span>`;
     const treeContainer = document.getElementById('filter-access-tree');
     treeContainer.innerHTML = '<div style="text-align:center; padding:20px;">Загрузка структуры... ⏳</div>';
-    
-    // Получаем сырые настройки клиента и всё дерево
-   // Получаем сырые настройки клиента и всё дерево
+
     const clients = await cachedApiFetch('/api/api_clients', true);
     const client = clients.find(c => c.id === clientId);
     let rules = {};
     try { rules = JSON.parse(client.access_rules || '{}'); } catch(e){}
-    
+
     const treeData = await cachedApiFetch('/api/access_tree');
 
-    // 1. Создаем карту всех папок (свойство children для вложенности)
+    // 1. Создаем карту всех папок 
     const foldersMap = { 0: {id: 0, name: '[Без папки / Общие]', parent_id: null, children: [], products: []} };
-    treeData.folders.forEach(f => {
-        foldersMap[f.id] = {...f, children: [], products: []};
-    });
+    treeData.folders.forEach(f => { foldersMap[f.id] = {...f, children: [], products: []}; });
 
     // 2. Распределяем товары по папкам
     treeData.products.forEach(p => {
@@ -7957,27 +8004,50 @@ async function openMarkups(clientId, clientName) {
         if(foldersMap[fid]) foldersMap[fid].products.push(p);
     });
 
-    // 3. Собираем реальное дерево (вкладываем дочерние папки в родительские)
+    // 3. Собираем реальное дерево 
     const rootFolders = [];
     Object.values(foldersMap).forEach(f => {
         if (f.id !== 0 && f.parent_id && foldersMap[f.parent_id]) {
             foldersMap[f.parent_id].children.push(f);
         } else {
-            rootFolders.push(f); // Корневые папки
+            rootFolders.push(f);
         }
     });
 
-    // 4. Сортируем папки и товары по алфавиту
+    // 4. УМНАЯ СОРТИРОВКА ПАПОК (Алфавит -> Гигабайты -> Терабайты)
+    function smartFolderSort(a, b) {
+        const keyA = a.name.toLowerCase().trim().match(/^(\d+)\s*(тб|tb|гб|gb)?$/);
+        const keyB = b.name.toLowerCase().trim().match(/^(\d+)\s*(тб|tb|гб|gb)?$/);
+        
+        let isStorageA = keyA ? 1 : 0;
+        let isStorageB = keyB ? 1 : 0;
+        
+        if (isStorageA !== isStorageB) return isStorageA - isStorageB; 
+        
+        if (isStorageA === 1) {
+            let valA = parseInt(keyA[1]);
+            if (keyA[2] === 'тб' || keyA[2] === 'tb') valA *= 1024;
+            
+            let valB = parseInt(keyB[1]);
+            if (keyB[2] === 'тб' || keyB[2] === 'tb') valB *= 1024;
+            
+            return valA - valB; 
+        }
+        
+        return a.name.localeCompare(b.name); 
+    }
+
     function sortFolderTree(folder) {
-        folder.children.sort((a, b) => a.name.localeCompare(b.name));
+        folder.children.sort(smartFolderSort);
         folder.products.sort((a, b) => a.name.localeCompare(b.name));
         folder.children.forEach(sortFolderTree);
     }
+    
+    rootFolders.sort(smartFolderSort);
     rootFolders.forEach(sortFolderTree);
 
-    // 5. РЕКУРСИВНАЯ ФУНКЦИЯ: Отрисовывает папки внутри папок
+    // 5. РЕКУРСИВНАЯ ФУНКЦИЯ Отрисовки папок
     function buildFolderHtml(folder) {
-        // Проверяем, есть ли вообще товары в этой ветке (если пусто — скрываем)
         function hasProducts(f) {
             if (f.products.length > 0) return true;
             return f.children.some(hasProducts);
@@ -7986,7 +8056,6 @@ async function openMarkups(clientId, clientName) {
 
         const folderContentId = 'api-folder-content-' + folder.id;
 
-        // Открываем папку по умолчанию, если внутри уже есть выданные доступы
         function isAnyProductSelected(f) {
             if (f.products.some(prod => rules[prod.id] !== undefined)) return true;
             return f.children.some(isAnyProductSelected);
@@ -7996,7 +8065,6 @@ async function openMarkups(clientId, clientName) {
         const initialDisplay = hasSelectedProducts ? 'block' : 'none';
         const initialIcon = hasSelectedProducts ? '▼' : '▶';
 
-        // HTML самой папки
         let html = `<li style="margin-bottom:8px; background:rgba(255,255,255,0.03); padding:8px; border-radius:6px; border:1px solid #333;">
             <div style="display:flex; align-items:center; gap:8px;">
                 <span onclick="toggleApiVisibility('${folderContentId}', this)" style="cursor:pointer; color:#aaa; font-size:12px; width:20px; text-align:center; display:inline-block; user-select:none;">${initialIcon}</span>
@@ -8007,12 +8075,10 @@ async function openMarkups(clientId, clientName) {
             </div>
             <ul id="${folderContentId}" style="display:${initialDisplay}; list-style:none; padding-left:25px; margin-top:8px; border-left:1px solid #444;">`;
 
-        // СНАЧАЛА рисуем вложенные папки (рекурсивно)
         folder.children.forEach(child => {
             html += buildFolderHtml(child);
         });
 
-        // ЗАТЕМ рисуем товары, которые лежат конкретно в этой папке
         folder.products.forEach(prod => {
             const isProdAllowed = rules[prod.id] !== undefined;
             const allowedChats = rules[prod.id] || [];
@@ -8023,7 +8089,7 @@ async function openMarkups(clientId, clientName) {
                     📦 ${escapeHtml(prod.name)}
                 </label>
                 <ul style="list-style:none; padding-left:25px; margin-top:6px;">`;
-            
+
             if(prod.chats.length === 0) {
                 html += `<li style="color:#777; font-size:12px; font-style:italic;">Цены только ручные (нет поставщиков)</li>`;
             } else {
@@ -8044,7 +8110,7 @@ async function openMarkups(clientId, clientName) {
         return html;
     }
 
-    // 6. Запускаем сборку HTML с самых верхних (корневых) папок
+    // 6. СБОРКА И ВЫВОД НА ЭКРАН
     let finalHtml = '<ul style="list-style:none; padding:0; margin:0;">';
     rootFolders.forEach(root => {
         finalHtml += buildFolderHtml(root);
@@ -8056,10 +8122,8 @@ async function openMarkups(clientId, clientName) {
     // Синхронизируем состояние родительских галочек
     treeContainer.querySelectorAll('.cb-prod').forEach(cb => updateParentChecks(cb));
 
+    // Загружаем настройки публикации
     await loadPublishSettings(clientId);
-    
-    // Привязать событие сохранения
-  
 }
 
 
@@ -9957,7 +10021,7 @@ def public_api_catalog():
         photo_links = []
         if p['photo_url']:
             # Базовый URL вашего сервера
-            base_img_url = "https://engine.astoredirect.ru/static/uploads/"
+            base_img_url = "https://engine.astoredirect.ru/uploads/"
             photo_links = [
                 (f"{base_img_url}{link.strip()}" if not link.strip().startswith('http') else link.strip())
                 for link in p['photo_url'].split(',') if link.strip()
@@ -9977,7 +10041,7 @@ def public_api_catalog():
             'name': p['name'],
             'category_id': p['folder_id'],
             'price': final_price, 
-            'price2': "По запросу" if final_price == "По запросу" else None,
+            'price2': "По запросу" ,
             "photo_url": photo_links,
             'brand': p['brand'],
             'country': p['country'],
