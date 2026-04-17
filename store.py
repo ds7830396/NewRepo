@@ -249,7 +249,6 @@ import json
 from flask import request, jsonify
 
 
-
 @app.route('/api/autofill', methods=['POST'])
 def autofill():
     data = request.json
@@ -1683,10 +1682,23 @@ def publish_scheduler():
                     final_products = []
                     
                     # Перебираем товары и разрешенных поставщиков из JSON
+                    # Перебираем товары и разрешенных поставщиков из JSON
                     for p_id_str, allowed_suppliers in allowed_items.items():
                         if not allowed_suppliers: 
                             continue
                         
+                        # --- НОВАЯ ЛОГИКА ДЛЯ "ЦЕНА ПО ЗАПРОСУ" ---
+                        if '0' in allowed_suppliers or 0 in allowed_suppliers:
+                            # У товара нет цен, достаем из базы только его название
+                            p_info = db.execute("SELECT name FROM products WHERE id = ?", (int(p_id_str),)).fetchone()
+                            if p_info:
+                                final_products.append({
+                                    'name': p_info['name'], 
+                                    'price': 'Цена по запросу'
+                                })
+                            continue  # Пропускаем запросы цен, идем к следующему товару
+                        # -----------------------------------------
+
                         placeholders = ','.join(['?'] * len(allowed_suppliers))
                         query_params = [int(p_id_str)] + allowed_suppliers
                         
@@ -1728,7 +1740,14 @@ def publish_scheduler():
                     template = pub['template'] or "🔥 Актуальные цены:\n\n{prices}\n\nДля заказа пишите менеджеру!"
                     
                     # 1. Красиво собираем товары в текстовый список
-                    prices_text = "\n".join([f"▪️ {p['name']} — {p['price']} ₽" for p in final_products])
+                    prices_lines = []
+                    for p in final_products:
+                        if p['price'] == 'Цена по запросу':
+                            prices_lines.append(f"▪️ {p['name']} — {p['price']}")
+                        else:
+                            prices_lines.append(f"▪️ {p['name']} — {p['price']} ₽")
+                            
+                    prices_text = "\n".join(prices_lines)
                     
                     # 2. Подставляем список вместо метки {prices}
                     if "{prices}" in template:
