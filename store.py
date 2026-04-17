@@ -249,6 +249,7 @@ import json
 from flask import request, jsonify
 
 
+
 @app.route('/api/autofill', methods=['POST'])
 def autofill():
     data = request.json
@@ -1413,53 +1414,6 @@ def edit_product(prod_id):
 
 
 
-@app.route('/api/products', methods=['POST'])
-@login_required
-def add_product():
-    data = request.get_json()
-    user_id = session['user_id']
-    db = get_db()
-
-    syns = data.get('synonyms', [])
-    synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
-
-    # НОВОЕ: Обработка нескольких ссылок на фото
-    photos = data.get('photo_url', [])
-    photo_url_str = ", ".join([p.strip() for p in photos if p.strip()]) if isinstance(photos, list) else (photos or '')
-
-    # Парсинг specs в строку для БД
-    specs_json = None
-    if data.get('specs'):
-        specs_json = json.dumps(data.get('specs'))
-
-    db.execute("""
-        INSERT INTO products 
-        (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request, color, storage, ram, warranty, description, specs) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id, 
-        data.get('name'), 
-        synonyms_str, 
-        data.get('price', 0), 
-        data.get('folder_id'),
-        photo_url_str,
-        data.get('brand'),
-        data.get('country'),
-        data.get('weight'),
-        data.get('model_number'),
-        1 if data.get('is_on_request') else 0,
-        
-        # 🔽 НОВЫЕ ПОЛЯ
-        data.get('color'),
-        data.get('storage'),
-        data.get('ram'),
-        data.get('warranty'),
-        data.get('description'),
-        specs_json
-    ))
-    db.commit()
-    notify_clients()
-    return jsonify({'success': True})
 
 
 @app.route('/api/access_tree')
@@ -3449,8 +3403,8 @@ def get_messages():
         where_clauses.append("m.is_favorite = 1")
     elif msg_type.startswith('folder_'):
         folder_id = msg_type.replace('folder_', '')
-        # Связываем сообщения с папкой через таблицу отслеживаемых чатов (tc)
-        where_clauses.append("tc.folder_id = ?")
+        # Ищем сообщения, которые были сохранены в эту папку
+        where_clauses.append("m.id IN (SELECT message_id FROM saved_messages WHERE folder_id = ?)")
         params.append(folder_id)
     elif msg_type.startswith('chat_'):
         chat_id = msg_type.replace('chat_', '')
@@ -8428,17 +8382,16 @@ window.updateParentChecks = function(el) {
     updateParentChecks(parentCb); // Идем выше
 };
 
-// Функция сбора данных и сохранения
 window.saveClientFilters = async function() {
     const clientId = document.getElementById('markup-client-id').value;
     const rules = {};
     
-    document.querySelectorAll('.prod-group').forEach(pGroup => {
+    // ИСПРАВЛЕНО: ищем по классу .prod-container
+    document.querySelectorAll('.prod-container').forEach(pGroup => {
         const prodCb = pGroup.querySelector('.cb-prod');
         if (prodCb && prodCb.checked) {
             const pid = pGroup.dataset.pid;
             const chatCbs = Array.from(pGroup.querySelectorAll('.cb-chat'));
-            
             if (chatCbs.length === 0) {
                 rules[pid] = ['all']; // Нет чатов, но товар разрешен
             } else {
@@ -8453,17 +8406,15 @@ window.saveClientFilters = async function() {
             }
         }
     });
-    
+
     await apiFetch(`/api/api_clients/${clientId}/filters`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ access_rules: rules })
     });
-    
     alert('✅ Дерево доступов успешно сохранено!');
-    window.apiCache = {}; 
+    window.apiCache = {};
 };
-
 
 
 
