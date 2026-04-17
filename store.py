@@ -521,7 +521,12 @@ def update_product_price():
      
     return jsonify({'success': True})
 
-
+def clean_for_search(text):
+    if not text: return set()
+    t = re.sub(r'[()*.[\]{},;!|/+\-]', ' ', text)
+    t = re.sub(r'\s+', ' ', t.replace('\xa0', ' ')).strip().lower()
+    t = t.translate(str.maketrans('асеокрх', 'aceokpx'))
+    return set(t.split())
 
 @app.route('/api/products', methods=['GET', 'POST'])
 @login_required
@@ -538,7 +543,49 @@ def manage_products():
             WHERE p.user_id = ?
         """
         products = db.execute(query, (user_id,)).fetchall()
-        return jsonify([dict(ix) for ix in products])
+        
+        # Достаем все сообщения для поиска совпадений
+        all_msgs = db.execute("SELECT text FROM messages WHERE user_id = ? ORDER BY date DESC LIMIT 1000", (user_id,)).fetchall()
+        
+        result = []
+        for p in products:
+            p_dict = dict(p)
+            p_dict['proposed_count'] = 0
+            
+            # Если нет подтвержденных, ищем предложенные
+            if p_dict['confirmed_count'] == 0 and p_dict['synonyms']:
+                synonyms_as_word_sets = []
+                for s in p_dict['synonyms'].split(','):
+                    if s.strip():
+                        words = clean_for_search(s)
+                        if words:
+                            synonyms_as_word_sets.append(words)
+                
+                has_proposed = False
+                if synonyms_as_word_sets:
+                    for row in all_msgs:
+                        if has_proposed: break
+                        lines = row['text'].split('\n') if row['text'] else []
+                        for line in lines:
+                            if not line.strip(): continue
+                            line_words = clean_for_search(line)
+                            for syn_set in synonyms_as_word_sets:
+                                if syn_set.issubset(line_words):
+                                    has_proposed = True
+                                    break
+                            if has_proposed: break
+                            
+                p_dict['proposed_count'] = 1 if has_proposed else 0
+            
+            # Также проверяем статус 'pending' в базе (для товаров из Excel и чужих API)
+            if p_dict['proposed_count'] == 0:
+                pending_count = db.execute("SELECT COUNT(*) FROM product_messages WHERE product_id = ? AND status = 'pending'", (p_dict['id'],)).fetchone()[0]
+                if pending_count > 0:
+                    p_dict['proposed_count'] = 1
+                    
+            result.append(p_dict)
+            
+        return jsonify(result)
         
     # POST
     # POST
@@ -5550,11 +5597,19 @@ qrBtn.addEventListener('click', async () => {
         let currentMergeSourceId = null;
 
         // ПОИСК ПО ТОВАРАМ
+        // ПОИСК ПО ТОВАРАМ (УМНЫЙ МУЛЬТИСЛОВЕСНЫЙ ПОИСК)
         document.getElementById('product-search')?.addEventListener('input', (e) => {
-            const term = e.target.value.toLowerCase();
+            // Разбиваем введенный текст на отдельные слова по пробелам, игнорируя лишние пробелы
+            const searchWords = e.target.value.toLowerCase().split(/\s+/).filter(word => word.length > 0);
+            
             document.querySelectorAll('#products-tbody tr').forEach(tr => {
                 const text = tr.innerText.toLowerCase();
-                tr.style.display = text.includes(term) ? '' : 'none';
+                
+                // Если поисковая строка пустая, every() вернет true и покажет все товары.
+                // Проверяем, что КАЖДОЕ слово из поиска есть в тексте строки товара (в любом порядке).
+                const isMatch = searchWords.every(word => text.includes(word));
+                
+                tr.style.display = isMatch ? '' : 'none';
             });
         });
 
@@ -5577,65 +5632,72 @@ qrBtn.addEventListener('click', async () => {
         });
 
         // ЗАГРУЗКА И ОТРИСОВКА ТОВАРОВ
-    async function loadProducts() {
-    // 1. Принудительно обновляем данные
-    const prods = await cachedApiFetch('/api/products', true); 
-    const tbody = document.getElementById('products-tbody');
-    if (!tbody) return;
-
-    // 2. Фильтруем по папке
-    const filtered = currentProductFolderView === 'all' 
-        ? prods 
-        : prods.filter(p => p.folder_id == currentProductFolderView);
-
-    tbody.innerHTML = filtered.map(p => {
-        // Защита от кавычек в названиях
-        const safeName = String(p.name || '').replace(/'/g, "\\'").replace(/"/g, "&quot;");
-        
-        // Логика цвета: если нет подтвержденных сообщений — ЯРКО КРАСНЫЙ
-        const hasConfirmed = p.confirmed_count > 0;
-        const rowBg = hasConfirmed ? 'transparent' : 'rgba(231, 76, 60, 0.15)';
-        const textColor = hasConfirmed ? '#ffffff' : '#ff4d4d';
-        
-        // Подготовка объекта для кнопки редактирования (чтобы не ломать JS кавычками)
-        const prodJson = JSON.stringify(p).replace(/"/g, '&quot;');
-
-        // --- НОВОЕ: Обрабатываем ссылки на фото, делаем их кликабельными ---
-        // --- Обрабатываем ссылки на фото для ТАБЛИЦЫ ---
-        let photosHtml = '—';
-        if (p.photo_url) {
-            const urls = p.photo_url.split(',').map(u => u.trim()).filter(u => u);
-            if (urls.length > 0) {
-                photosHtml = urls.map((url, i) => {
-                    // ИСПРАВЛЕНИЕ: Если это просто имя файла, добавляем /uploads/
-                    const validUrl = url.startsWith('http') ? url : `/uploads/${url}`;
-                    
-                    return `<a href="${validUrl}" target="_blank" style="color: #3498db; text-decoration: none; border-bottom: 1px dashed #3498db; margin-right: 5px; display: inline-block; margin-bottom: 4px;" onclick="event.stopPropagation()">Фото ${i+1}</a>`;
-                }).join(' ');
-            }
+   // ЗАГРУЗКА И ОТРИСОВКА ТОВАРОВ
+async function loadProducts() {
+// 1. Принудительно обновляем данные
+const prods = await cachedApiFetch('/api/products', true);
+const tbody = document.getElementById('products-tbody');
+if (!tbody) return;
+// 2. Фильтруем по папке
+const filtered = currentProductFolderView === 'all' ? prods : prods.filter(p => p.folder_id == currentProductFolderView);
+tbody.innerHTML = filtered.map(p => {
+    // Защита от кавычек в названиях
+    const safeName = String(p.name || '').replace(/'/g, "\\'").replace(/"/g, "&quot;");
+    
+    // --- НОВАЯ ЛОГИКА ЦВЕТОВ ---
+    const hasConfirmed = p.confirmed_count > 0;
+    const hasProposed = p.proposed_count > 0;
+    
+    let rowBg = 'transparent';
+    let textColor = '#ffffff';
+    let warningIcon = '';
+    
+    if (!hasConfirmed) {
+        if (hasProposed) {
+            // Есть предложенные (Синий)
+            rowBg = 'rgba(52, 152, 219, 0.15)'; 
+            textColor = '#3498db'; 
+            warningIcon = '💡 ';
+        } else {
+            // Нет ни подтвержденных, ни предложенных (Красный)
+            rowBg = 'rgba(231, 76, 60, 0.15)'; 
+            textColor = '#ff4d4d'; 
+            warningIcon = '⚠️ ';
         }
-        // ------------------------------------------------
-        // -------------------------------------------------------------------
+    }
+    // ---------------------------
 
-        return `
-            <tr style="cursor: pointer; background: ${rowBg}; color: ${textColor}; transition: 0.2s;" 
-                onclick="openProductBinding(${p.id}, '${safeName}')">
-                <td style="padding: 12px;"><strong>${hasConfirmed ? '' : '⚠️ '}${p.name}</strong></td>
-                <td>${p.brand || '—'}</td>
-                <td>${p.model_number || '—'}</td>
-                <td>${p.country || '—'}</td>
-                <td>${p.weight || '—'}</td>
-                
-                <td style="text-align: left; font-size: 12px; max-width: 150px; flex-wrap: wrap;">${photosHtml}</td>
-                
-                <td style="color: #aaa; font-size: 0.9em; max-width: 200px; overflow: hidden; text-overflow: ellipsis;">${p.synonyms || 'нет'}</td>
-                <td style="white-space: nowrap;" onclick="event.stopPropagation();">
-                    <button class="save-btn" onclick='openEditModal(${prodJson})' style="background:#f39c12; margin-right:4px;">✏️</button>
-                    <button class="save-btn" onclick="deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
-                </td>
-            </tr>
-        `;
-    }).join('');
+    // Подготовка объекта для кнопки редактирования
+    const prodJson = JSON.stringify(p).replace(/"/g, '&quot;');
+    
+    // --- Обрабатываем ссылки на фото для ТАБЛИЦЫ ---
+    let photosHtml = '—';
+    if (p.photo_url) {
+        const urls = p.photo_url.split(',').map(u => u.trim()).filter(u => u);
+        if (urls.length > 0) {
+            photosHtml = urls.map((url, i) => {
+                const validUrl = url.startsWith('http') ? url : `/uploads/${url}`;
+                return `<a href="${validUrl}" target="_blank" style="color: #3498db; text-decoration: none; border-bottom: 1px dashed #3498db; margin-right: 5px; display: inline-block; margin-bottom: 4px;" onclick="event.stopPropagation()">Фото ${i+1}</a>`;
+            }).join(' ');
+        }
+    }
+
+    return `
+    <tr style="cursor: pointer; background: ${rowBg}; color: ${textColor}; transition: 0.2s;" onclick="openProductBinding(${p.id}, '${safeName}')">
+        <td style="padding: 12px;"><strong>${warningIcon}${p.name}</strong></td>
+        <td>${p.brand || '—'}</td>
+        <td>${p.model_number || '—'}</td>
+        <td>${p.country || '—'}</td>
+        <td>${p.weight || '—'}</td>
+        <td style="text-align: left; font-size: 12px; max-width: 150px; flex-wrap: wrap;">${photosHtml}</td>
+        <td style="color: #aaa; font-size: 0.9em; max-width: 200px; overflow: hidden; text-overflow: ellipsis;">${p.synonyms || 'нет'}</td>
+        <td style="white-space: nowrap;" onclick="event.stopPropagation();">
+            <button class="save-btn" onclick='openEditModal(${prodJson})' style="background:#f39c12; margin-right:4px;">✏️</button>
+            <button class="save-btn" onclick="deleteProduct(${p.id})" style="background:#e74c3c;">❌</button>
+        </td>
+    </tr>
+    `;
+}).join('');
 }
 
 // ФУНКЦИЯ ОЧИСТКИ ФОРМЫ (Исправлена для новых ID)
@@ -5659,7 +5721,10 @@ function resetForm() {
     document.getElementById('ram').value = '';
     document.getElementById('warranty').value = '';
     document.getElementById('description').value = '';
-    document.getElementById('specs').value = '';
+    let specsField = document.getElementById('specs');
+if (specsField) {
+    specsField.value = '';
+}
     // Авто-подстановка текущей открытой папки
     const fSelect = document.getElementById('p-folder-id');
     if (fSelect) {
