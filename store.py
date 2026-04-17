@@ -258,44 +258,61 @@ def autofill():
         return jsonify({"error": "No product name"}), 400
 
     prompt = f"""
-    Ты - старший эксперт по заполнению карточек товаров для интернет-магазина.
-    В магазин поступают самые разные товары: смартфоны, ноутбуки, планшеты, наушники, аксессуары.
-    Твоя задача: проанализировать название: "{product_name}" и максимально точно заполнить характеристики.
+Ты - старший эксперт по заполнению карточек товаров для интернет-магазина.
+В магазин поступают самые разные товары: смартфоны, ноутбуки, планшеты, наушники, аксессуары.
+Твоя задача: проанализировать название: "{product_name}" и максимально точно заполнить характеристики, опираясь на свои знания о технике.
 
-    ВАЖНЫЕ ПРАВИЛА:
-    1. Идентификация Apple: Если в названии есть "13", "14 Pro", "15", "16 Pro Max", "17 Pro" и т.д. без бренда — это "Apple", модель "iPhone [номер]". AirPods, MacBook, iPad - тоже Apple.
-    2. Идентификация Samsung: "S23", "S24", "A54", "Fold" — бренд "Samsung", модель "Galaxy [название]".
-    3. Тип SIM (для телефонов): "(2Sim)", "Dual", "ZA/A", "CH/A" -> "Dual SIM" (в country_sim). "(eSim)", "LL/A" -> "eSIM only".
-    4. Пустые поля: Если для товара характеристика не применима (например, диагональ экрана для наушников) или данных нет, ОБЯЗАТЕЛЬНО оставляй поле пустым: "". Не выдумывай того, чего нет.
-    5. Гарантия: по умолчанию "12 месяцев".
-    6. АРТИКУЛ (model_no): Генерируй в самом конце, опираясь на уже определенные цвет, память и модель.
-       - ТОЛЬКО ДЛЯ IPHONE: сгенерируй корень оригинального артикула (Part Number) из 5 символов, начинающийся на "M" (например: MY0L4, MU793).
-       - ДЛЯ ОСТАЛЬНЫХ ТОВАРОВ: пиши официальный заводской код, если точно его знаешь. Если не знаешь - оставляй пустым "".
-    7. Описание (description): Напиши привлекательное описание товара на 2-3 предложения, выделяя его главные преимущества для покупателя.
+ОБЩИЕ ПРАВИЛА:
+1. Идентификация Apple: Если в названии есть "13", "14 Pro", "15", "16 Pro Max", "17 Pro" и т.д. без бренда — это "Apple", модель "iPhone [номер]". AirPods, MacBook, iPad - тоже Apple.
+2. Идентификация Samsung: "S23", "S24", "A54", "Fold" — бренд "Samsung", модель "Galaxy [название]".
+3. Пустые поля: Если для товара характеристика не применима (например, диагональ экрана для наушников) или данных просто нет, ОБЯЗАТЕЛЬНО оставляй поле пустым: "". Не выдумывай того, чего нет.
 
-    Верни результат СТРОГО в формате JSON, без текста, без markdown.
-    Ключи должны идти строго в таком порядке (чтобы ты сначала собрал характеристики, а артикул и описание выдал в конце):
-    {{
-      "brand": "",
-      "country_sim": "",
-      "weight": "",
-      "color": "",
-      "storage": "",
-      "ram": "",
-      "display": "",
-      "processor": "",
-      "camera": "",
-      "front_camera": "",
-      "video": "",
-      "connectivity": "",
-      "battery": "",
-      "os": "",
-      "biometrics": "",
-      "charging": "",
-      "warranty": "12 месяцев",
-      "model_no": "",
-      "description": ""
-    }}
+ИНСТРУКЦИЯ ПО ЗАПОЛНЕНИЮ КАЖДОГО ПОЛЯ (СТРОГИЕ ФОРМАТЫ):
+- "brand": Производитель товара (например: Apple, Samsung, Xiaomi, Dyson).
+- "country_sim": Тип SIM-карты (для смартфонов). Если в названии "(2Sim)", "Dual", "ZA/A", "CH/A" -> пиши "Dual SIM". Если "(eSim)", "LL/A" -> пиши "eSIM only". Если это версия для физической + виртуальной карты, пиши "nano-SIM + eSIM".
+- "weight": Вес товара СТРОГО в килограммах. Формат: ноль или число, точка, три цифры. Например: "0.350", "1.200", "0.050". Если точный вес неизвестен, оставь "".
+- "color": Цвет товара на русском языке (например: Черный, Белый, Натуральный титановый). Переводи английские названия цветов из названия товара.
+- "storage": Объем встроенной памяти. СТРОГИЙ ФОРМАТ: Цифра + пробел + "GB" или "TB" (например: "256 GB", "512 GB", "1 TB").
+- "ram": Объем оперативной памяти. СТРОГИЙ ФОРМАТ: Цифра + пробел + "GB" (например: "8 GB", "16 GB").
+- "display": Характеристики экрана. СТРОГИЙ ФОРМАТ: [Диагональ]" [Тип матрицы] ([Особенности]), [Частота] Гц. Например: "6.9\" OLED (Super Retina XDR), 120 Гц" или "6.8\" Dynamic AMOLED 2X, 120 Гц".
+- "processor": Точное название чипа. СТРОГИЙ ФОРМАТ: Производитель + Модель. Например: "Apple A19 Pro", "Qualcomm Snapdragon 8 Gen 3".
+- "camera": Характеристики основного блока камер. СТРОГИЙ ФОРМАТ: Мегапиксели через плюс. Например: "48 МП + 48 МП + 12 МП" или "50 МП + 12 МП".
+- "front_camera": Характеристики фронтальной камеры. Формат: "12 МП" или "12 МП + 3D сенсор".
+- "video": Максимальное разрешение и частота кадров основной камеры. Например: "4K@60fps", "8K@30fps".
+- "connectivity": Беспроводные сети и модули (через запятую). Например: "Wi-Fi 7, Bluetooth 5.3, 5G, NFC".
+- "battery": Автономность. СТРОГИЙ ФОРМАТ: "до [число] часов работы" (например: "до 22 часов работы", "до 29 часов работы"). Если измеряется только в мАч (как у Android), пиши "5000 мАч".
+- "os": Операционная система "из коробки" для этой модели (например: "iOS 18", "Android 14").
+- "biometrics": Способы разблокировки. Например: "Face ID" (для Apple) или "Сканер отпечатка пальца (в экране), Распознавание лица" (для Android).
+- "charging": Поддерживаемые технологии зарядки. СТРОГИЙ ФОРМАТ: перечисление через запятую. Например: "MagSafe, быстрая зарядка, беспроводная зарядка".
+- "warranty": По умолчанию всегда "12 месяцев".
+- "model_no": АРТИКУЛ. Генерируй в самом конце. 
+   > ДЛЯ IPHONE: сгенерируй корень оригинального артикула (Part Number) из 5 символов, начинающийся на "M" (например: MY0L4, MU793). 
+   > ДЛЯ ОСТАЛЬНЫХ: пиши официальный заводской код, если точно его знаешь, иначе "".
+- "description": Напиши привлекательное продающее описание товара на 2-3 предложения, выделяя его главные преимущества для покупателя.
+
+Верни результат СТРОГО в формате JSON, без приветствий, без пояснений, без markdown.
+Ключи должны идти строго в таком порядке (чтобы ты сначала собрал характеристики, а артикул и описание выдал в конце):
+{{
+   "brand": "",
+   "country_sim": "",
+   "weight": "",
+   "color": "",
+   "storage": "",
+   "ram": "",
+   "display": "",
+   "processor": "",
+   "camera": "",
+   "front_camera": "",
+   "video": "",
+   "connectivity": "",
+   "battery": "",
+   "os": "",
+   "biometrics": "",
+   "charging": "",
+   "warranty": "12 месяцев",
+   "model_no": "",
+   "description": ""
+}}
     """
 
     try:
@@ -8192,7 +8209,7 @@ async function openMarkups(clientId, clientName) {
         }
     });
 
-    // 4. УМНАЯ СОРТИРОВКА ПАПОК (Алфавит -> Гигабайты -> Терабайты)
+    // 4. УМНАЯ СОРТИРОВКА ПАПОК 
     function smartFolderSort(a, b) {
         const keyA = a.name.toLowerCase().trim().match(/^(\d+)\s*(тб|tb|гб|gb)?$/);
         const keyB = b.name.toLowerCase().trim().match(/^(\d+)\s*(тб|tb|гб|gb)?$/);
@@ -8205,13 +8222,10 @@ async function openMarkups(clientId, clientName) {
         if (isStorageA === 1) {
             let valA = parseInt(keyA[1]);
             if (keyA[2] === 'тб' || keyA[2] === 'tb') valA *= 1024;
-            
             let valB = parseInt(keyB[1]);
             if (keyB[2] === 'тб' || keyB[2] === 'tb') valB *= 1024;
-            
             return valA - valB; 
         }
-        
         return a.name.localeCompare(b.name); 
     }
 
@@ -8224,8 +8238,32 @@ async function openMarkups(clientId, clientName) {
     rootFolders.sort(smartFolderSort);
     rootFolders.forEach(sortFolderTree);
 
+    // --- НОВЫЕ БЕЗОТКАЗНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ ДЕРЕВА ---
+    window.toggleApiFolder = function(contentId, iconId) {
+        const contentDiv = document.getElementById(contentId);
+        const iconSpan = document.getElementById(iconId);
+        if (!contentDiv || !iconSpan) return;
+
+        if (contentDiv.style.display === 'none') {
+            contentDiv.style.display = 'block';
+            iconSpan.textContent = '▼';
+        } else {
+            contentDiv.style.display = 'none';
+            iconSpan.textContent = '▶';
+        }
+    };
+
+    window.apiToggleAll = function(containerId, isChecked) {
+        const container = document.getElementById(containerId);
+        if (container) {
+            // Находим все чекбоксы внутри блока и ставим им такую же галочку
+            container.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = isChecked);
+        }
+    };
+    // ---------------------------------------------------
+
     // 5. РЕКУРСИВНАЯ ФУНКЦИЯ Отрисовки папок
-    function buildFolderHtml(folder) {
+    function buildFolderHtml(folder, level = 0) {
         function hasProducts(f) {
             if (f.products.length > 0) return true;
             return f.children.some(hasProducts);
@@ -8233,6 +8271,7 @@ async function openMarkups(clientId, clientName) {
         if (!hasProducts(folder)) return '';
 
         const folderContentId = 'api-folder-content-' + folder.id;
+        const folderIconId = 'api-folder-icon-' + folder.id;
 
         function isAnyProductSelected(f) {
             if (f.products.some(prod => rules[prod.id] !== undefined)) return true;
@@ -8240,66 +8279,73 @@ async function openMarkups(clientId, clientName) {
         }
 
         const hasSelectedProducts = isAnyProductSelected(folder);
-        const initialDisplay = hasSelectedProducts ? 'block' : 'none';
-        const initialIcon = hasSelectedProducts ? '▼' : '▶';
+        // Сбрасываем дисплей и иконку так, чтобы они всегда были закрыты по умолчанию
+        const initialDisplay = 'none'; 
+        const initialIcon = '▶';
 
-        let html = `<li style="margin-bottom:8px; background:rgba(255,255,255,0.03); padding:8px; border-radius:6px; border:1px solid #333;">
-            <div style="display:flex; align-items:center; gap:8px;">
-                <span onclick="toggleApiVisibility('${folderContentId}', this)" style="cursor:pointer; color:#aaa; font-size:12px; width:20px; text-align:center; display:inline-block; user-select:none;">${initialIcon}</span>
-                <label style="font-weight:bold; color:#f39c12; display:flex; align-items:center; gap:8px; cursor:pointer; margin:0; flex:1;">
-                    <input type="checkbox" class="cb-folder" onchange="toggleAccessLevel(this, '.cb-prod', '.cb-chat')">
-                    📁 ${escapeHtml(folder.name)}
-                </label>
+        // --- БЛОК ПАПКИ (Исправлен onchange) ---
+        let html = `<div style="margin-left: ${level * 20}px; margin-bottom: 5px;">
+            <div style="display: flex; align-items: center;">
+                <input type="checkbox" class="cb-folder" onchange="apiToggleAll('${folderContentId}', this.checked)" style="margin-right: 8px; cursor: pointer;">
+                <strong style="color: #f39c12; cursor: pointer; user-select: none;" 
+                        onclick="toggleApiFolder('${folderContentId}', '${folderIconId}')">
+                    <span id="${folderIconId}" style="display: inline-block; width: 15px; text-align: center;">${initialIcon}</span> 📁 ${escapeHtml(folder.name)}
+                </strong>
             </div>
-            <ul id="${folderContentId}" style="display:${initialDisplay}; list-style:none; padding-left:25px; margin-top:8px; border-left:1px solid #444;">`;
+        </div>
+        <div id="${folderContentId}" style="display: ${initialDisplay};">`;
 
         folder.children.forEach(child => {
-            html += buildFolderHtml(child);
+            html += buildFolderHtml(child, level + 1);
         });
 
         folder.products.forEach(prod => {
             const isProdAllowed = rules[prod.id] !== undefined;
             const allowedChats = rules[prod.id] || [];
+            
+            // Генерируем уникальный ID для внутренностей товара
+            const productContentId = 'api-product-content-' + prod.id;
 
-            html += `<li style="margin-bottom:8px; background:#1e1e1e; padding:8px; border-radius:6px; border:1px solid #2a2a2a;" class="prod-group" data-pid="${prod.id}">
-                <label style="color:#4a90e2; display:flex; gap:8px; border-bottom:1px solid #333; padding-bottom:4px; cursor:pointer;">
-                    <input type="checkbox" class="cb-prod" ${isProdAllowed ? 'checked' : ''} onchange="toggleAccessLevel(this, '.cb-chat', null)">
-                    📦 ${escapeHtml(prod.name)}
-                </label>
-                <ul style="list-style:none; padding-left:25px; margin-top:6px;">`;
+            // --- БЛОК ТОВАРА (Исправлен onchange) ---
+            html += `<div style="margin-left: ${(level + 1) * 20}px; margin-bottom: 3px;" class="prod-group" data-pid="${prod.id}">
+                <div style="display:flex; align-items:center; margin-bottom: 2px;">
+                    <input type="checkbox" class="cb-prod" ${isProdAllowed ? 'checked' : ''} onchange="apiToggleAll('${productContentId}', this.checked)" style="margin-right: 8px; cursor: pointer;">
+                    <span>📦 ${escapeHtml(prod.name)}</span>
+                </div>
+                <div id="${productContentId}">`;
 
+            // --- БЛОК ПОСТАВЩИКОВ / ЦЕН (Убраны старые onchange) ---
             if(prod.chats.length === 0) {
-                html += `<li style="color:#777; font-size:12px; font-style:italic;">Цены только ручные (нет поставщиков)</li>`;
+                const isReqChecked = isProdAllowed && allowedChats.includes('0') ? 'checked' : '';
+                html += `<div style="margin-left: 24px; display:flex; align-items:center; font-size:13px; color:#f39c12;">
+                    <input type="checkbox" class="cb-chat" value="0" ${isReqChecked} style="margin-right: 8px; cursor:pointer;">
+                    <span>⏳ Цена по запросу</span>
+                </div>`;
             } else {
                 prod.chats.forEach(chat => {
                     const isChatAllowed = isProdAllowed && (allowedChats.includes('all') || allowedChats.includes(String(chat.chat_id)));
-                    html += `<li>
-                        <label style="color:#ccc; display:flex; gap:8px; font-size:13px; cursor:pointer; padding:3px 0;">
-                            <input type="checkbox" class="cb-chat" value="${chat.chat_id}" ${isChatAllowed ? 'checked' : ''} onchange="updateParentChecks(this)">
-                            💬 ${escapeHtml(chat.name)}
-                        </label>
-                    </li>`;
+                    html += `<div style="margin-left: 24px; display:flex; align-items:center; font-size:13px; color:#aaa;">
+                        <input type="checkbox" class="cb-chat" value="${chat.chat_id}" ${isChatAllowed ? 'checked' : ''} style="margin-right: 8px; cursor:pointer;">
+                        <span>💬 ${escapeHtml(chat.name)}</span>
+                    </div>`;
                 });
             }
-            html += `</ul></li>`;
+            html += `</div></div>`;
         });
 
-        html += `</ul></li>`;
+        html += `</div>`;
         return html;
     }
 
     // 6. СБОРКА И ВЫВОД НА ЭКРАН
-    let finalHtml = '<ul style="list-style:none; padding:0; margin:0;">';
+    let finalHtml = '<div style="padding: 10px;">'; 
     rootFolders.forEach(root => {
-        finalHtml += buildFolderHtml(root);
+        finalHtml += buildFolderHtml(root, 0); 
     });
-    finalHtml += '</ul>';
+    finalHtml += '</div>';
 
     treeContainer.innerHTML = finalHtml;
     
-    // Синхронизируем состояние родительских галочек
-    treeContainer.querySelectorAll('.cb-prod').forEach(cb => updateParentChecks(cb));
-
     // Загружаем настройки публикации
     await loadPublishSettings(clientId);
 }
@@ -9514,17 +9560,20 @@ function renderPublishTree(folders, products, suppliers, allowedItems) {
         const folderIconId = 'pub-folder-icon-' + folder.id;
 
         // ДОБАВЛЕНО: Чекбокс для папки. При клике вызывает toggleAllInContainer
+        // Рисуем название папки как КЛИКАБЕЛЬНУЮ кнопку
         let nodeHtml = `<div style="margin-left: ${level * 20}px; margin-bottom: 5px;">
             <div style="display: flex; align-items: center;">
                 <input type="checkbox" onchange="toggleAllInContainer('${folderContentId}', this.checked)" style="margin-right: 8px; cursor: pointer;">
                 <strong style="color: #f39c12; cursor: pointer; user-select: none;" 
                         onclick="toggleFolderNode('${folderContentId}', '${folderIconId}')">
-                    <span id="${folderIconId}" style="display: inline-block; width: 15px;">▼</span> 📁 ${escapeHtml(folder.name)}
+                    <span id="${folderIconId}" style="display: inline-block; width: 15px; text-align: center;">▶</span> 📁 ${escapeHtml(folder.name)}
                 </strong>
             </div>
         </div>
         
-        <div id="${folderContentId}" style="display: block;">`;
+        <div id="${folderContentId}" style="display: none;">`;
+        
+        
 
         const folderProducts = products.filter(p => p.folder_id === folder.id);
         folderProducts.forEach(p => {
