@@ -36,6 +36,11 @@ import tempfile
 import pdfplumber
 sqlite3.register_adapter(datetime, lambda d: d.strftime("%Y-%m-%d %H:%M:%S"))
 
+
+
+
+
+
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -239,7 +244,75 @@ def check_session_token():
         except Exception:
             pass
 
+import google.generativeai as genai
+import json
+from flask import request, jsonify
 
+
+
+@app.route('/api/autofill', methods=['POST'])
+def autofill():
+    data = request.json
+    product_name = data.get('name', '')
+
+    if not product_name:
+        return jsonify({"error": "No product name"}), 400
+
+    prompt = f"""
+    Ты - старший эксперт по заполнению карточек товаров для интернет-магазина.
+    В магазин поступают самые разные товары: смартфоны, ноутбуки, планшеты, наушники, аксессуары.
+    Твоя задача: проанализировать название: "{product_name}" и максимально точно заполнить характеристики.
+
+    ВАЖНЫЕ ПРАВИЛА:
+    1. Идентификация Apple: Если в названии есть "13", "14 Pro", "15", "16 Pro Max", "17 Pro" и т.д. без бренда — это "Apple", модель "iPhone [номер]". AirPods, MacBook, iPad - тоже Apple.
+    2. Идентификация Samsung: "S23", "S24", "A54", "Fold" — бренд "Samsung", модель "Galaxy [название]".
+    3. Тип SIM (для телефонов): "(2Sim)", "Dual", "ZA/A", "CH/A" -> "Dual SIM" (в country_sim). "(eSim)", "LL/A" -> "eSIM only".
+    4. Пустые поля: Если для товара характеристика не применима (например, диагональ экрана для наушников) или данных нет, ОБЯЗАТЕЛЬНО оставляй поле пустым: "". Не выдумывай того, чего нет.
+    5. Гарантия: по умолчанию "12 месяцев".
+    6. АРТИКУЛ (model_no): Генерируй в самом конце, опираясь на уже определенные цвет, память и модель.
+       - ТОЛЬКО ДЛЯ IPHONE: сгенерируй корень оригинального артикула (Part Number) из 5 символов, начинающийся на "M" (например: MY0L4, MU793).
+       - ДЛЯ ОСТАЛЬНЫХ ТОВАРОВ: пиши официальный заводской код, если точно его знаешь. Если не знаешь - оставляй пустым "".
+    7. Описание (description): Напиши привлекательное описание товара на 2-3 предложения, выделяя его главные преимущества для покупателя.
+
+    Верни результат СТРОГО в формате JSON, без текста, без markdown.
+    Ключи должны идти строго в таком порядке (чтобы ты сначала собрал характеристики, а артикул и описание выдал в конце):
+    {{
+      "brand": "",
+      "country_sim": "",
+      "weight": "",
+      "color": "",
+      "storage": "",
+      "ram": "",
+      "display": "",
+      "processor": "",
+      "camera": "",
+      "front_camera": "",
+      "video": "",
+      "connectivity": "",
+      "battery": "",
+      "os": "",
+      "biometrics": "",
+      "charging": "",
+      "warranty": "12 месяцев",
+      "model_no": "",
+      "description": ""
+    }}
+    """
+
+    try:
+        # Используем gemini-1.5-flash (самая быстрая и дешевая для таких задач)
+        model = genai.GenerativeModel('gemini-3.1-flash-lite-preview')
+        response = model.generate_content(prompt)
+        
+        # Убираем возможную разметку ```json ... ``` которую иногда выдает ИИ
+        result_text = response.text.replace('```json', '').replace('```', '').strip()
+        
+        parsed_data = json.loads(result_text)
+        return jsonify(parsed_data)
+        
+    except Exception as e:
+        print("Ошибка Gemini:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 
 
@@ -463,6 +536,10 @@ def get_fingerprint(chat_id, sender_name, line):
     norm_line = re.sub(r'\b\d{1,3}(?:[ .,]\d{3})+\b|\b\d{4,}\b', '[PRICE]', line.lower())
     norm_line = re.sub(r'[₽$€рRkKкК]', '', norm_line).strip()
     return f"{chat_id}_{sender_name}_{norm_line}"
+
+
+
+
 
 
 
@@ -4409,8 +4486,16 @@ TEMPLATE = """
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
         <div style="grid-column: span 2;">
             <label style="color:#aaa; font-size:12px;">Название</label>
-            <input type="text" id="p-name" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
+            <div style="display: flex; gap: 10px;">
+                <input type="text" id="p-name" style="flex: 1; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;" placeholder="Например: 17 Pro Max 256 Silver (eSim)">
+                <button type="button" id="btn-autofill" onclick="autoFillWithAI()" style="padding: 8px 15px; background: linear-gradient(45deg, #8e44ad, #3498db); border: none; color: white; border-radius: 4px; cursor: pointer; font-weight: bold; white-space: nowrap; transition: opacity 0.2s;">
+                    ✨ Автозаполнение
+                </button>
+            </div>
         </div>
+
+   
+
         <div>
             <label style="color:#aaa; font-size:12px;">Бренд</label>
             <input type="text" id="p-brand" style="width:100%; padding:8px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; box-sizing: border-box;">
@@ -5031,6 +5116,15 @@ TEMPLATE = """
     </div>
     </div>
     <script>
+    function escapeHtml(unsafe) {
+        if (!unsafe) return '';
+        return unsafe.toString()
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
     let currentPage = 1;
     let currentLimit = 20; // Дефолт 20
     const applyBtn = document.getElementById('apply-filters');
@@ -9334,38 +9428,108 @@ async function openPublishEditor(pubId = null) {
     renderPublishTree(treeData.folders, treeData.products, treeData.suppliers, allowedItems); 
 }
 
+async function autoFillWithAI() {
+    const nameInput = document.getElementById('p-name').value.trim();
+    if (!nameInput) {
+        alert("Сначала введите название товара!");
+        return;
+    }
+
+    const btn = document.getElementById('btn-autofill');
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '⏳ Думаю...';
+    btn.disabled = true;
+    btn.style.opacity = '0.7';
+
+    try {
+        const response = await fetch('/api/autofill', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: nameInput })
+        });
+
+        if (!response.ok) throw new Error('Ошибка при обращении к серверу');
+
+        const data = await response.json();
+
+        // Заполняем основные поля
+        if(data.brand) document.getElementById('p-brand').value = data.brand;
+        if(data.model_no) document.getElementById('p-model').value = data.model_no;
+        if(data.country_sim) document.getElementById('p-country').value = data.country_sim;
+        if(data.weight) document.getElementById('p-weight').value = data.weight;
+        if(data.description) document.getElementById('description').value = data.description;
+        // Заполняем характеристики
+        if(data.color) document.getElementById('color').value = data.color;
+        if(data.storage) document.getElementById('storage').value = data.storage;
+        if(data.ram) document.getElementById('ram').value = data.ram;
+        if(data.warranty) document.getElementById('warranty').value = data.warranty;
+        
+        // Заполняем технические спецификации
+        if(data.display) document.getElementById('spec-display').value = data.display;
+        if(data.processor) document.getElementById('spec-processor').value = data.processor;
+        if(data.camera) document.getElementById('spec-camera').value = data.camera;
+        if(data.front_camera) document.getElementById('spec-front-camera').value = data.front_camera;
+        if(data.video) document.getElementById('spec-video').value = data.video;
+        if(data.connectivity) document.getElementById('spec-connectivity').value = data.connectivity;
+        if(data.battery) document.getElementById('spec-battery').value = data.battery;
+        if(data.os) document.getElementById('spec-os').value = data.os;
+        if(data.biometrics) document.getElementById('spec-biometrics').value = data.biometrics;
+        if(data.charging) document.getElementById('spec-charging').value = data.charging;
+
+    } catch (error) {
+        console.error(error);
+        alert("Не удалось сгенерировать данные. Попробуйте еще раз.");
+    } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+        btn.style.opacity = '1';
+    }
+}
+
 function renderPublishTree(folders, products, suppliers, allowedItems) {
-        const container = document.getElementById('pub-filter-tree');
-        let html = '';
+    const container = document.getElementById('pub-filter-tree');
+    let html = '';
 
-        // --- ВОТ ЭТУ ФУНКЦИЮ ПОЛНОСТЬЮ ЗАМЕНЯЕМ ---
-        function buildNode(folder, level) {
-            // Генерируем уникальные ID для контейнера и иконки-стрелочки
-            const folderContentId = 'pub-folder-content-' + folder.id;
-            const folderIconId = 'pub-folder-icon-' + folder.id;
+    function buildNode(folder, level) {
+        const folderContentId = 'pub-folder-content-' + folder.id;
+        const folderIconId = 'pub-folder-icon-' + folder.id;
 
-            // Рисуем название папки как КЛИКАБЕЛЬНУЮ кнопку
-            let nodeHtml = `<div style="margin-left: ${level * 20}px; margin-bottom: 5px;">
+        // ДОБАВЛЕНО: Чекбокс для папки. При клике вызывает toggleAllInContainer
+        let nodeHtml = `<div style="margin-left: ${level * 20}px; margin-bottom: 5px;">
+            <div style="display: flex; align-items: center;">
+                <input type="checkbox" onchange="toggleAllInContainer('${folderContentId}', this.checked)" style="margin-right: 8px; cursor: pointer;">
                 <strong style="color: #f39c12; cursor: pointer; user-select: none;" 
                         onclick="toggleFolderNode('${folderContentId}', '${folderIconId}')">
                     <span id="${folderIconId}" style="display: inline-block; width: 15px;">▼</span> 📁 ${escapeHtml(folder.name)}
                 </strong>
             </div>
+        </div>
+        
+        <div id="${folderContentId}" style="display: block;">`;
+
+        const folderProducts = products.filter(p => p.folder_id === folder.id);
+        folderProducts.forEach(p => {
+            const productSuppliers = suppliers.filter(s => s.product_id === p.id);
+            const productContentId = 'pub-product-content-' + p.id;
             
-            <div id="${folderContentId}" style="display: block;">`; // <--- ОТКРЫВАЕМ КОНТЕЙНЕР ДЛЯ СКРЫТИЯ
+            nodeHtml += `<div style="margin-left: ${(level + 1) * 20}px; margin-bottom: 3px;">
+                <div style="display:flex; align-items:center; margin-bottom: 2px;">
+                    <input type="checkbox" onchange="toggleAllInContainer('${productContentId}', this.checked)" style="margin-right: 8px; cursor: pointer;">
+                    <span>📦 ${escapeHtml(p.name)}</span>
+                </div>
+                
+                <div id="${productContentId}">`;
 
-            // Рисуем товары внутри папки
-            const folderProducts = products.filter(p => p.folder_id === folder.id);
-            folderProducts.forEach(p => {
-                const productSuppliers = suppliers.filter(s => s.product_id === p.id);
-                if (productSuppliers.length === 0) return; // Скрываем товары без цен
-
-                nodeHtml += `<div style="margin-left: ${(level + 1) * 20}px; margin-bottom: 3px;">
-                    <div style="display:flex; align-items:center; margin-bottom: 2px;">
-                        <span>📦 ${escapeHtml(p.name)}</span>
-                    </div>`;
-
-                // Рисуем чекбоксы с поставщиками
+            // --- НОВАЯ ЛОГИКА ---
+            if (productSuppliers.length === 0) {
+                // Если цен нет, создаем виртуальный чекбокс "Цена по запросу" (значение '0')
+                const isChecked = (allowedItems[p.id] && allowedItems[p.id].includes('0')) ? 'checked' : '';
+                nodeHtml += `<div style="margin-left: 24px; display:flex; align-items:center; font-size:13px; color:#f39c12;">
+                    <input type="checkbox" class="pub-supplier-cb" data-product="${p.id}" value="0" ${isChecked} style="margin-right: 8px; cursor:pointer;">
+                    <span>⏳ Цена по запросу</span>
+                </div>`;
+            } else {
+                // Если цены есть, выводим их как обычно
                 productSuppliers.forEach(sup => {
                     const isChecked = (allowedItems[p.id] && allowedItems[p.id].includes(sup.supplier_id.toString())) ? 'checked' : '';
                     nodeHtml += `<div style="margin-left: 24px; display:flex; align-items:center; font-size:13px; color:#aaa;">
@@ -9373,27 +9537,40 @@ function renderPublishTree(folders, products, suppliers, allowedItems) {
                         <span>👤 ${escapeHtml(sup.supplier_name || 'Неизвестный чат')} (${sup.extracted_price} руб.)</span>
                     </div>`;
                 });
-                nodeHtml += `</div>`;
-            });
+            }
+            // --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
-            // Рисуем подпапки
-            const children = folders.filter(f => f.parent_id === folder.id);
-            children.forEach(c => {
-                nodeHtml += buildNode(c, level + 1);
-            });
-
-            nodeHtml += `</div>`; // <--- ЗАКРЫВАЕМ КОНТЕЙНЕР, КОТОРЫЙ БУДЕМ СВОРАЧИВАТЬ
-
-            return nodeHtml;
-        }
-        // --- КОНЕЦ ЗАМЕНЫ ---
-
-        const rootFolders = folders.filter(f => f.parent_id === null);
-        rootFolders.forEach(f => {
-            html += buildNode(f, 0);
+            nodeHtml += `</div></div>`;
         });
-        container.innerHTML = html;
+
+        const children = folders.filter(f => f.parent_id === folder.id);
+        children.forEach(c => {
+            nodeHtml += buildNode(c, level + 1);
+        });
+
+        nodeHtml += `</div>`;
+        return nodeHtml;
     }
+
+    const rootFolders = folders.filter(f => f.parent_id === null);
+    rootFolders.forEach(f => {
+        html += buildNode(f, 0);
+    });
+    container.innerHTML = html;
+}
+
+
+// Функция для выбора сразу всех элементов внутри папки или товара
+function toggleAllInContainer(containerId, isChecked) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    
+    // Ищем все чекбоксы внутри выбранного блока и ставим/снимаем с них галочки
+    const checkboxes = container.querySelectorAll('input[type="checkbox"]');
+    checkboxes.forEach(cb => {
+        cb.checked = isChecked;
+    });
+}
 
 async function savePublication() {
     const pubId = document.getElementById('pub_id').value;
